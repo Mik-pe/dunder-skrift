@@ -1,0 +1,6 @@
+build/
+.dunder-cache/
+*.o
+*.app/
+.DS_Store
+__pycache__/

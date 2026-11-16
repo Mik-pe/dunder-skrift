@@ -1,0 +1,30 @@
+// Consumer example importing `dunder-skrift` via `dunder.toml` [dependencies].
+import skrift.font as font
+import sys
+
+fn main() -> i32 {
+    path := if sys.arg_count() >= 2 { sys.arg(1) } else { "/System/Library/Fonts/Supplemental/Arial.ttf" }
+    word := if sys.arg_count() >= 3 { sys.arg(2) } else { "AVA" }
+    if !sys.metadata(path).is_file {
+        print(f"Font not found at {path}; pass <font-file> [word] as arguments.")
+        return 0
+    }
+    mut face := font.Face::from_file(path, 0)
+    if !face.ok {
+        _ := sys.eprint(face.error)
+        return 1
+    }
+    face.set_pixel_size(18.0)
+    m := face.metrics()
+    rt := face.render_text(word)
+    print(f"Loaded {m.family} ({m.num_glyphs} glyphs, upem={m.units_per_em})")
+    print(f"Rendered '{word}' -> {rt.width}x{rt.height}, advance={rt.advance_x}")
+    0
+}
+
+@test fn package_dependency_imports_skrift_api() {
+    // Verify invalid input produces clean Face diagnostic via package import `skrift.font`.
+    empty: []u8 = []
+    bad := font.Face::from_bytes(&empty, 0)
+    assert(!bad.ok && bad.error != "")
+}

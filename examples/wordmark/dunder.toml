@@ -1,0 +1,7 @@
+name = "wordmark"
+version = "0.1.0"
+root = "src/main.ddr"
+test_root = "src/main.ddr"
+
+[dependencies]
+skrift = "../.."

@@ -1,0 +1,266 @@
+// FreeType-style vector glyph outline representation supporting lines,
+// quadratic Beziers (TrueType), cubic Beziers (CFF/CFF2), affine transforms,
+// bounding boxes, and adaptive curve flattening.
+
+pub enum Verb { MoveTo = 0, LineTo = 1, QuadTo = 2, CubicTo = 3 }
+
+pub struct BBox {
+    valid: bool,
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+pub struct Polyline {
+    xs: []f64,
+    ys: []f64,
+    contour_starts: []i32,
+    contour_ends: []i32,
+}
+
+pub struct Outline {
+    ok: bool,
+    error: string,
+    verbs: []Verb,
+    point_starts: []i32,
+    xs: []f64,
+    ys: []f64,
+}
+
+impl Outline {
+    pub fn new() -> Self {
+        Self { ok: true, error: "", verbs: [], point_starts: [], xs: [], ys: [] }
+    }
+
+    pub fn fail(move msg: string) -> Self {
+        Self { ok: false, error: msg, verbs: [], point_starts: [], xs: [], ys: [] }
+    }
+
+    pub fn clear(&mut self) {
+        self.ok = true
+        self.error = ""
+        self.verbs.clear()
+        self.point_starts.clear()
+        self.xs.clear()
+        self.ys.clear()
+    }
+
+    pub fn move_to(&mut self, x: f64, y: f64) {
+        self.point_starts.push(self.xs.len)
+        self.verbs.push(.MoveTo)
+        self.xs.push(x)
+        self.ys.push(y)
+    }
+
+    pub fn line_to(&mut self, x: f64, y: f64) {
+        self.point_starts.push(self.xs.len)
+        self.verbs.push(.LineTo)
+        self.xs.push(x)
+        self.ys.push(y)
+    }
+
+    pub fn quad_to(&mut self, cx: f64, cy: f64, x: f64, y: f64) {
+        self.point_starts.push(self.xs.len)
+        self.verbs.push(.QuadTo)
+        self.xs.push(cx)
+        self.ys.push(cy)
+        self.xs.push(x)
+        self.ys.push(y)
+    }
+
+    pub fn cubic_to(&mut self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) {
+        self.point_starts.push(self.xs.len)
+        self.verbs.push(.CubicTo)
+        self.xs.push(c1x)
+        self.ys.push(c1y)
+        self.xs.push(c2x)
+        self.ys.push(c2y)
+        self.xs.push(x)
+        self.ys.push(y)
+    }
+
+    pub fn segment_count(&self) -> i32 { self.verbs.len }
+
+    pub fn contour_count(&self) -> i32 {
+        mut count := 0
+        for v in &self.verbs {
+            if v == .MoveTo { count += 1 }
+        }
+        count
+    }
+
+    pub fn scale(&mut self, sx: f64, sy: f64) {
+        for i in 0..self.xs.len {
+            self.xs[i] = self.xs[i] * sx
+            self.ys[i] = self.ys[i] * sy
+        }
+    }
+
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        for i in 0..self.xs.len {
+            self.xs[i] = self.xs[i] + dx
+            self.ys[i] = self.ys[i] + dy
+        }
+    }
+
+    pub fn append_transformed(&mut self, other: &Outline, m00: f64, m01: f64, m10: f64, m11: f64, tx: f64, ty: f64) {
+        for i in 0..other.verbs.len {
+            v := other.verbs[i]
+            p := other.point_starts[i]
+            match v {
+                .MoveTo => {
+                    x := other.xs[p]; y := other.ys[p]
+                    self.move_to(m00 * x + m01 * y + tx, m10 * x + m11 * y + ty)
+                },
+                .LineTo => {
+                    x := other.xs[p]; y := other.ys[p]
+                    self.line_to(m00 * x + m01 * y + tx, m10 * x + m11 * y + ty)
+                },
+                .QuadTo => {
+                    cx := other.xs[p]; cy := other.ys[p]
+                    x := other.xs[p + 1]; y := other.ys[p + 1]
+                    self.quad_to(
+                        m00 * cx + m01 * cy + tx, m10 * cx + m11 * cy + ty,
+                        m00 * x + m01 * y + tx, m10 * x + m11 * y + ty
+                    )
+                },
+                .CubicTo => {
+                    c1x := other.xs[p]; c1y := other.ys[p]
+                    c2x := other.xs[p + 1]; c2y := other.ys[p + 1]
+                    x := other.xs[p + 2]; y := other.ys[p + 2]
+                    self.cubic_to(
+                        m00 * c1x + m01 * c1y + tx, m10 * c1x + m11 * c1y + ty,
+                        m00 * c2x + m01 * c2y + tx, m10 * c2x + m11 * c2y + ty,
+                        m00 * x + m01 * y + tx, m10 * x + m11 * y + ty
+                    )
+                },
+            }
+        }
+    }
+
+    pub fn bounds(&self) -> BBox {
+        if self.xs.len == 0 {
+            return BBox { valid: false, min_x: 0.0, min_y: 0.0, max_x: 0.0, max_y: 0.0 }
+        }
+        mut min_x := self.xs[0]
+        mut max_x := self.xs[0]
+        mut min_y := self.ys[0]
+        mut max_y := self.ys[0]
+        for i in 1..self.xs.len {
+            x := self.xs[i]
+            y := self.ys[i]
+            if x < min_x { min_x = x }
+            if x > max_x { max_x = x }
+            if y < min_y { min_y = y }
+            if y > max_y { max_y = y }
+        }
+        BBox { valid: true, min_x: min_x, min_y: min_y, max_x: max_x, max_y: max_y }
+    }
+
+    pub fn flatten(&self, tolerance: f64) -> Polyline {
+        mut tol := tolerance
+        if tol < 0.005 { tol = 0.005 }
+        mut poly := Polyline { xs: [], ys: [], contour_starts: [], contour_ends: [] }
+        mut cur_x := 0.0
+        mut cur_y := 0.0
+        mut start_x := 0.0
+        mut start_y := 0.0
+        mut active := false
+
+        for i in 0..self.verbs.len {
+            v := self.verbs[i]
+            p := self.point_starts[i]
+            match v {
+                .MoveTo => {
+                    if active {
+                        close_contour(&mut poly, cur_x, cur_y, start_x, start_y)
+                    }
+                    poly.contour_starts.push(poly.xs.len)
+                    x := self.xs[p]; y := self.ys[p]
+                    poly.xs.push(x)
+                    poly.ys.push(y)
+                    cur_x = x; cur_y = y
+                    start_x = x; start_y = y
+                    active = true
+                },
+                .LineTo => {
+                    x := self.xs[p]; y := self.ys[p]
+                    poly.xs.push(x); poly.ys.push(y)
+                    cur_x = x; cur_y = y
+                },
+                .QuadTo => {
+                    cx := self.xs[p]; cy := self.ys[p]
+                    x := self.xs[p + 1]; y := self.ys[p + 1]
+                    flatten_quad(&mut poly, cur_x, cur_y, cx, cy, x, y, tol, 0)
+                    cur_x = x; cur_y = y
+                },
+                .CubicTo => {
+                    c1x := self.xs[p]; c1y := self.ys[p]
+                    c2x := self.xs[p + 1]; c2y := self.ys[p + 1]
+                    x := self.xs[p + 2]; y := self.ys[p + 2]
+                    flatten_cubic(&mut poly, cur_x, cur_y, c1x, c1y, c2x, c2y, x, y, tol, 0)
+                    cur_x = x; cur_y = y
+                },
+            }
+        }
+        if active {
+            close_contour(&mut poly, cur_x, cur_y, start_x, start_y)
+        }
+        poly
+    }
+}
+
+fn close_contour(poly: &mut Polyline, cur_x: f64, cur_y: f64, start_x: f64, start_y: f64) {
+    if (cur_x - start_x).abs() > 1e-6 || (cur_y - start_y).abs() > 1e-6 {
+        poly.xs.push(start_x)
+        poly.ys.push(start_y)
+    }
+    poly.contour_ends.push(poly.xs.len)
+}
+
+fn flatten_quad(poly: &mut Polyline, x0: f64, y0: f64, cx: f64, cy: f64, x1: f64, y1: f64, tol: f64, depth: i32) {
+    mx := 0.5 * (x0 + x1)
+    my := 0.5 * (y0 + y1)
+    dx := cx - mx
+    dy := cy - my
+    if depth >= 10 || (dx * dx + dy * dy) <= tol * tol {
+        poly.xs.push(x1)
+        poly.ys.push(y1)
+        return
+    }
+    x01 := 0.5 * (x0 + cx); y01 := 0.5 * (y0 + cy)
+    x12 := 0.5 * (cx + x1); y12 := 0.5 * (cy + y1)
+    xm := 0.5 * (x01 + x12); ym := 0.5 * (y01 + y12)
+    flatten_quad(&mut poly, x0, y0, x01, y01, xm, ym, tol, depth + 1)
+    flatten_quad(&mut poly, xm, ym, x12, y12, x1, y1, tol, depth + 1)
+}
+
+fn flatten_cubic(poly: &mut Polyline, x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64, tol: f64, depth: i32) {
+    dx := x3 - x0
+    dy := y3 - y0
+    d1 := ((x1 - x3) * dy - (y1 - y3) * dx).abs()
+    d2 := ((x2 - x3) * dy - (y2 - y3) * dx).abs()
+    len2 := dx * dx + dy * dy
+    mut flat := false
+    if len2 < 1e-9 {
+        // Nearly closed / degenerate chord: compare control points directly against endpoints.
+        flat = (x1 - x0).abs() <= tol && (y1 - y0).abs() <= tol && (x2 - x3).abs() <= tol && (y2 - y3).abs() <= tol
+    } else {
+        limit := tol * len2.sqrt()
+        flat = d1 <= limit && d2 <= limit
+    }
+    if depth >= 10 || flat {
+        poly.xs.push(x3)
+        poly.ys.push(y3)
+        return
+    }
+    x01 := 0.5 * (x0 + x1); y01 := 0.5 * (y0 + y1)
+    x12 := 0.5 * (x1 + x2); y12 := 0.5 * (y1 + y2)
+    x23 := 0.5 * (x2 + x3); y23 := 0.5 * (y2 + y3)
+    x012 := 0.5 * (x01 + x12); y012 := 0.5 * (y01 + y12)
+    x123 := 0.5 * (x12 + x23); y123 := 0.5 * (y12 + y23)
+    xm := 0.5 * (x012 + x123); ym := 0.5 * (y012 + y123)
+    flatten_cubic(&mut poly, x0, y0, x01, y01, x012, y012, xm, ym, tol, depth + 1)
+    flatten_cubic(&mut poly, xm, ym, x123, y123, x23, y23, x3, y3, tol, depth + 1)
+}

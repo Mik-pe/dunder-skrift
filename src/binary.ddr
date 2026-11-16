@@ -1,0 +1,282 @@
+// Bounds-checked big-endian binary reader, SFNT tags, fixed-point helpers,
+// and text decoders (UTF-16BE, MacRoman) for OpenType/TrueType parsing.
+import std.bytes as bytes
+import sys
+
+pub struct Reader {
+    pos: i32,
+    end: i32,
+    ok: bool,
+    error: string,
+}
+
+impl Reader {
+    pub fn new(buf: &[]u8) -> Self {
+        Self { pos: 0, end: buf.len, ok: true, error: "" }
+    }
+
+    pub fn slice(buf: &[]u8, start: i32, length: i32) -> Self {
+        if start < 0 || length < 0 || start > buf.len || length > buf.len - start {
+            return Self { pos: 0, end: 0, ok: false, error: "slice out of bounds" }
+        }
+        Self { pos: start, end: start + length, ok: true, error: "" }
+    }
+
+    pub fn remaining(&self) -> i32 {
+        if !self.ok || self.pos > self.end { return 0 }
+        self.end - self.pos
+    }
+
+    pub fn seek(&mut self, offset: i32) {
+        if !self.ok { return }
+        if offset < 0 || offset > self.end {
+            self.fail("seek out of bounds")
+            return
+        }
+        self.pos = offset
+    }
+
+    pub fn skip(&mut self, count: i32) {
+        if !self.ok { return }
+        if count < 0 || count > self.end - self.pos {
+            self.fail("unexpected end of data")
+            return
+        }
+        self.pos += count
+    }
+
+    pub fn fail(&mut self, move msg: string) {
+        if self.ok {
+            self.ok = false
+            self.error = msg
+        }
+    }
+
+    pub fn read_u8(&mut self, buf: &[]u8) -> i32 {
+        if !self.ok { return 0 }
+        if self.pos >= self.end { self.fail("unexpected end of data"); return 0 }
+        v := i32(buf[self.pos])
+        self.pos += 1
+        v
+    }
+
+    pub fn read_i8(&mut self, buf: &[]u8) -> i32 {
+        v := self.read_u8(&buf)
+        if v >= 128 { return v - 256 }
+        v
+    }
+
+    pub fn read_u16(&mut self, buf: &[]u8) -> i32 {
+        if !self.ok { return 0 }
+        if self.pos < 0 || self.pos + 2 > self.end || self.pos + 2 > buf.len { self.fail("unexpected end of data"); return 0 }
+        v := bytes.u16_be(&buf, self.pos)
+        self.pos += 2
+        v
+    }
+
+    pub fn read_i16(&mut self, buf: &[]u8) -> i32 {
+        if !self.ok { return 0 }
+        if self.pos < 0 || self.pos + 2 > self.end || self.pos + 2 > buf.len { self.fail("unexpected end of data"); return 0 }
+        v := bytes.i16_be(&buf, self.pos)
+        self.pos += 2
+        v
+    }
+
+    pub fn read_u24(&mut self, buf: &[]u8) -> i32 {
+        if !self.ok { return 0 }
+        if self.pos < 0 || self.pos + 3 > self.end || self.pos + 3 > buf.len { self.fail("unexpected end of data"); return 0 }
+        v := (i32(buf[self.pos]).shl(16)
+            .bit_or(i32(buf[self.pos + 1]).shl(8))
+            .bit_or(i32(buf[self.pos + 2])))
+        self.pos += 3
+        v
+    }
+
+    pub fn read_u32(&mut self, buf: &[]u8) -> u32 {
+        if !self.ok { return 0 }
+        if self.pos < 0 || self.pos + 4 > self.end || self.pos + 4 > buf.len { self.fail("unexpected end of data"); return 0 }
+        v := u32(bytes.u32_be(&buf, self.pos))
+        self.pos += 4
+        v
+    }
+
+    pub fn read_i32(&mut self, buf: &[]u8) -> i32 {
+        if !self.ok { return 0 }
+        if self.pos < 0 || self.pos + 4 > self.end || self.pos + 4 > buf.len { self.fail("unexpected end of data"); return 0 }
+        v := bytes.i32_be(&buf, self.pos)
+        self.pos += 4
+        v
+    }
+
+    pub fn read_i64(&mut self, buf: &[]u8) -> i64 {
+        if !self.ok { return 0 }
+        if self.pos < 0 || self.pos + 8 > self.end || self.pos + 8 > buf.len { self.fail("unexpected end of data"); return 0 }
+        v := bytes.i64_be(&buf, self.pos)
+        self.pos += 8
+        v
+    }
+
+    pub fn read_f2dot14(&mut self, buf: &[]u8) -> f64 {
+        raw := self.read_i16(&buf)
+        f64(raw) / 16384.0
+    }
+
+    pub fn read_fixed(&mut self, buf: &[]u8) -> f64 {
+        raw := self.read_i32(&buf)
+        f64(raw) / 65536.0
+    }
+
+    pub fn read_tag_string(&mut self, buf: &[]u8) -> string {
+        t := self.read_u32(&buf)
+        if !self.ok { return "" }
+        tag_to_string(t)
+    }
+}
+
+pub fn peek_u16(buf: &[]u8, offset: i32) -> i32 {
+    if offset < 0 || offset + 2 > buf.len { return 0 }
+    bytes.u16_be(&buf, offset)
+}
+
+pub fn peek_i16(buf: &[]u8, offset: i32) -> i32 {
+    if offset < 0 || offset + 2 > buf.len { return 0 }
+    bytes.i16_be(&buf, offset)
+}
+
+pub fn peek_u32(buf: &[]u8, offset: i32) -> u32 {
+    if offset < 0 || offset + 4 > buf.len { return 0 }
+    u32(bytes.u32_be(&buf, offset))
+}
+
+pub fn tag_from_str(name: string) -> u32 {
+    if name.len != 4 { return 0 }
+    (u32(name[0]).shl(24)
+        .bit_or(u32(name[1]).shl(16))
+        .bit_or(u32(name[2]).shl(8))
+        .bit_or(u32(name[3])))
+}
+
+pub fn tag_to_string(tag: u32) -> string {
+    mut out: []u8 = []
+    out.reserve(4)
+    for shift in [24, 16, 8, 0] {
+        b := i32(tag.shr(shift).bit_and(255))
+        if b >= 32 && b <= 126 { out.push(u8(b)) }
+        else { out.push(b'?') }
+    }
+    dec := bytes.decode(&out)
+    if dec.ok { return dec.value }
+    "????"
+}
+
+pub fn sfnt_checksum(buf: &[]u8, offset: i32, length: i32) -> u32 {
+    if offset < 0 || length < 0 || offset > buf.len || length > buf.len - offset { return 0 }
+    mut sum: u32 = 0
+    mut i := 0
+    while i + 4 <= length {
+        w := peek_u32(&buf, offset + i)
+        sum = sum.wrapping_add(w)
+        i += 4
+    }
+    if i < length {
+        mut tail: u32 = 0
+        for j in 0..4 {
+            tail = tail.shl(8)
+            if i + j < length {
+                tail = tail.bit_or(u32(buf[offset + i + j]))
+            }
+        }
+        sum = sum.wrapping_add(tail)
+    }
+    sum
+}
+
+pub fn decode_utf16be(buf: &[]u8, offset: i32, length: i32) -> string {
+    if offset < 0 || length < 0 || offset > buf.len || length > buf.len - offset { return "" }
+    mut out: []u8 = []
+    out.reserve(length)
+    mut i := 0
+    while i + 2 <= length {
+        u1 := peek_u16(&buf, offset + i)
+        i += 2
+        mut cp := u1
+        if u1 >= 55296 && u1 <= 56319 && i + 2 <= length {
+            u2 := peek_u16(&buf, offset + i)
+            if u2 >= 56320 && u2 <= 57343 {
+                cp = 65536 + (u1 - 55296).shl(10) + (u2 - 56320)
+                i += 2
+            } else {
+                cp = 65533
+            }
+        } else if u1 >= 55296 && u1 <= 57343 {
+            cp = 65533
+        }
+        append_utf8_cp(&mut out, cp)
+    }
+    dec := bytes.decode(&out)
+    if dec.ok { return dec.value }
+    ""
+}
+
+pub fn decode_macroman(buf: &[]u8, offset: i32, length: i32) -> string {
+    if offset < 0 || length < 0 || offset > buf.len || length > buf.len - offset { return "" }
+    high: [i32; 128] = [
+        196, 197, 199, 201, 209, 214, 220, 225, 224, 226, 228, 227, 229, 231, 233, 232,
+        234, 235, 237, 236, 238, 239, 241, 243, 242, 244, 246, 245, 250, 249, 251, 252,
+        8224, 176, 162, 163, 167, 8226, 182, 223, 174, 169, 8482, 180, 168, 8800, 198, 216,
+        8734, 177, 8804, 8805, 165, 181, 8706, 8721, 8719, 960, 8747, 170, 186, 937, 230, 248,
+        191, 161, 172, 8730, 402, 8776, 8710, 171, 187, 8230, 160, 192, 195, 213, 338, 339,
+        8211, 8212, 8220, 8221, 8216, 8217, 247, 9674, 255, 376, 8260, 8364, 8249, 8250, 64257, 64258,
+        8225, 183, 8218, 8222, 8240, 194, 202, 193, 203, 200, 205, 206, 207, 204, 211, 212,
+        63743, 210, 218, 219, 217, 305, 710, 732, 175, 728, 729, 730, 184, 733, 731, 711
+    ]
+    mut out: []u8 = []
+    out.reserve(length)
+    for i in 0..length {
+        b := i32(buf[offset + i])
+        if b < 128 {
+            out.push(u8(b))
+        } else {
+            append_utf8_cp(&mut out, high[b - 128])
+        }
+    }
+    dec := bytes.decode(&out)
+    if dec.ok { return dec.value }
+    ""
+}
+
+fn append_utf8_cp(out: &mut []u8, cp: i32) {
+    mut c := cp
+    if c < 0 || c > 1114111 || (c >= 55296 && c <= 57343) { c = 65533 }
+    if c < 128 {
+        out.push(u8(c))
+    } else if c < 2048 {
+        out.push(u8(192.bit_or(c.shr(6))))
+        out.push(u8(128.bit_or(c.bit_and(63))))
+    } else if c < 65536 {
+        out.push(u8(224.bit_or(c.shr(12))))
+        out.push(u8(128.bit_or(c.shr(6).bit_and(63))))
+        out.push(u8(128.bit_or(c.bit_and(63))))
+    } else {
+        out.push(u8(240.bit_or(c.shr(18))))
+        out.push(u8(128.bit_or(c.shr(12).bit_and(63))))
+        out.push(u8(128.bit_or(c.shr(6).bit_and(63))))
+        out.push(u8(128.bit_or(c.bit_and(63))))
+    }
+}
+
+@test fn big_endian_reads_and_decoders() {
+    data: []u8 = [0x00, 0x01, 0x80, 0x00, 0xff, 0xff, 0x4f, 0x54, 0x54, 0x4f]
+    mut r := Reader::new(&data)
+    r.read_u16(&data) == 1
+    r.read_i16(&data) == -32768
+    r.read_i16(&data) == -1
+    r.read_tag_string(&data) == "OTTO"
+    r.remaining() == 0
+    r.ok
+    utf16: []u8 = [0x00, 0x41, 0x00, 0xe5, 0xd8, 0x3c, 0xdf, 0x0d]
+    decode_utf16be(&utf16, 0, utf16.len) == "Aå🌍"
+    mac: []u8 = [0x41, 0x8c, 0x9f]
+    decode_macroman(&mac, 0, mac.len) == "Aåü"
+    tag_to_string(tag_from_str("glyf")) == "glyf"
+}

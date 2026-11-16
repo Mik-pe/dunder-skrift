@@ -1,0 +1,375 @@
+// Core OpenType/TrueType metadata and metrics tables:
+// head, maxp, hhea, hmtx, vhea/vmtx (optional), OS/2, post, and name.
+import binary as bin
+import sfnt
+
+pub struct HeadTable {
+    ok: bool,
+    error: string,
+    units_per_em: i32,
+    flags: i32,
+    x_min: i32,
+    y_min: i32,
+    x_max: i32,
+    y_max: i32,
+    mac_style: i32,
+    lowest_rec_ppem: i32,
+    index_to_loc_format: i32,
+}
+
+impl HeadTable {
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        mut r := dir.table_reader("head")
+        if !r.ok { return Self::fail(r.error.clone()) }
+        major := r.read_u16(&dir.data)
+        minor := r.read_u16(&dir.data)
+        _ := r.read_fixed(&dir.data) // fontRevision
+        _ := r.read_u32(&dir.data)   // checksumAdjustment
+        magic := r.read_u32(&dir.data)
+        flags := r.read_u16(&dir.data)
+        upem := r.read_u16(&dir.data)
+        _ := r.read_i64(&dir.data) // created
+        _ := r.read_i64(&dir.data) // modified
+        x_min := r.read_i16(&dir.data)
+        y_min := r.read_i16(&dir.data)
+        x_max := r.read_i16(&dir.data)
+        y_max := r.read_i16(&dir.data)
+        mac_style := r.read_u16(&dir.data)
+        lowest_rec_ppem := r.read_u16(&dir.data)
+        _ := r.read_i16(&dir.data) // fontDirectionHint
+        loc_fmt := r.read_i16(&dir.data)
+        _ := r.read_i16(&dir.data) // glyphDataFormat
+        if !r.ok || major != 1 || minor != 0 || magic != 0x5F0F3CF5 {
+            return Self::fail("invalid head table")
+        }
+        if upem < 16 || upem > 16384 {
+            return Self::fail("invalid unitsPerEm in head")
+        }
+        if loc_fmt != 0 && loc_fmt != 1 {
+            return Self::fail("unsupported indexToLocFormat in head")
+        }
+        Self {
+            ok: true, error: "",
+            units_per_em: upem, flags: flags,
+            x_min: x_min, y_min: y_min, x_max: x_max, y_max: y_max,
+            mac_style: mac_style, lowest_rec_ppem: lowest_rec_ppem,
+            index_to_loc_format: loc_fmt,
+        }
+    }
+
+    fn fail(move msg: string) -> Self {
+        Self {
+            ok: false, error: msg, units_per_em: 0, flags: 0,
+            x_min: 0, y_min: 0, x_max: 0, y_max: 0,
+            mac_style: 0, lowest_rec_ppem: 0, index_to_loc_format: 0,
+        }
+    }
+}
+
+pub struct MaxpTable {
+    ok: bool,
+    error: string,
+    num_glyphs: i32,
+}
+
+impl MaxpTable {
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        mut r := dir.table_reader("maxp")
+        if !r.ok { return Self { ok: false, error: r.error.clone(), num_glyphs: 0 } }
+        _ := r.read_u32(&dir.data) // version
+        n := r.read_u16(&dir.data)
+        if !r.ok || n <= 0 {
+            return Self { ok: false, error: "invalid maxp table", num_glyphs: 0 }
+        }
+        Self { ok: true, error: "", num_glyphs: n }
+    }
+}
+
+pub struct HheaTable {
+    ok: bool,
+    error: string,
+    ascender: i32,
+    descender: i32,
+    line_gap: i32,
+    advance_width_max: i32,
+    min_lsb: i32,
+    min_rsb: i32,
+    x_max_extent: i32,
+    number_of_hmetrics: i32,
+}
+
+impl HheaTable {
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        mut r := dir.table_reader("hhea")
+        if !r.ok { return Self::fail(r.error.clone()) }
+        major := r.read_u16(&dir.data)
+        minor := r.read_u16(&dir.data)
+        ascender := r.read_i16(&dir.data)
+        descender := r.read_i16(&dir.data)
+        line_gap := r.read_i16(&dir.data)
+        adv_max := r.read_u16(&dir.data)
+        min_lsb := r.read_i16(&dir.data)
+        min_rsb := r.read_i16(&dir.data)
+        x_max_extent := r.read_i16(&dir.data)
+        _ := r.read_i16(&dir.data) // caretSlopeRise
+        _ := r.read_i16(&dir.data) // caretSlopeRun
+        _ := r.read_i16(&dir.data) // caretOffset
+        r.skip(8)                   // 4 reserved i16
+        _ := r.read_i16(&dir.data) // metricDataFormat
+        nhm := r.read_u16(&dir.data)
+        if !r.ok || major != 1 || minor != 0 || nhm <= 0 {
+            return Self::fail("invalid hhea table")
+        }
+        Self {
+            ok: true, error: "",
+            ascender: ascender, descender: descender, line_gap: line_gap,
+            advance_width_max: adv_max, min_lsb: min_lsb, min_rsb: min_rsb,
+            x_max_extent: x_max_extent, number_of_hmetrics: nhm,
+        }
+    }
+
+    fn fail(move msg: string) -> Self {
+        Self {
+            ok: false, error: msg, ascender: 0, descender: 0, line_gap: 0,
+            advance_width_max: 0, min_lsb: 0, min_rsb: 0, x_max_extent: 0,
+            number_of_hmetrics: 0,
+        }
+    }
+}
+
+pub struct HmtxTable {
+    ok: bool,
+    error: string,
+    advances: []i32,
+    lsbs: []i32,
+}
+
+impl HmtxTable {
+    pub fn parse(dir: &sfnt.TableDirectory, num_glyphs: i32, num_hmetrics: i32) -> Self {
+        mut r := dir.table_reader("hmtx")
+        if !r.ok { return Self { ok: false, error: r.error.clone(), advances: [], lsbs: [] } }
+        mut nhm := num_hmetrics
+        if nhm > num_glyphs { nhm = num_glyphs }
+        mut advances: []i32 = []
+        mut lsbs: []i32 = []
+        advances.reserve(num_glyphs)
+        lsbs.reserve(num_glyphs)
+        mut last_adv := 0
+        for _ in 0..nhm {
+            adv := r.read_u16(&dir.data)
+            lsb := r.read_i16(&dir.data)
+            if !r.ok { return Self { ok: false, error: "truncated hmtx metrics", advances: [], lsbs: [] } }
+            last_adv = adv
+            advances.push(adv)
+            lsbs.push(lsb)
+        }
+        for _ in nhm..num_glyphs {
+            lsb := r.read_i16(&dir.data)
+            if !r.ok { return Self { ok: false, error: "truncated hmtx side bearings", advances: [], lsbs: [] } }
+            advances.push(last_adv)
+            lsbs.push(lsb)
+        }
+        Self { ok: true, error: "", advances: advances, lsbs: lsbs }
+    }
+
+    pub fn advance(&self, gid: i32) -> i32 {
+        if gid < 0 || gid >= self.advances.len { return 0 }
+        self.advances[gid]
+    }
+
+    pub fn lsb(&self, gid: i32) -> i32 {
+        if gid < 0 || gid >= self.lsbs.len { return 0 }
+        self.lsbs[gid]
+    }
+}
+
+pub struct Os2Table {
+    present: bool,
+    version: i32,
+    avg_char_width: i32,
+    weight_class: i32,
+    width_class: i32,
+    fs_selection: i32,
+    typo_ascender: i32,
+    typo_descender: i32,
+    typo_line_gap: i32,
+    win_ascent: i32,
+    win_descent: i32,
+    x_height: i32,
+    cap_height: i32,
+}
+
+impl Os2Table {
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        mut out := Self {
+            present: false, version: 0, avg_char_width: 0,
+            weight_class: 400, width_class: 5, fs_selection: 0,
+            typo_ascender: 0, typo_descender: 0, typo_line_gap: 0,
+            win_ascent: 0, win_descent: 0, x_height: 0, cap_height: 0,
+        }
+        mut r := dir.table_reader("OS/2")
+        if !r.ok { return out }
+        ver := r.read_u16(&dir.data)
+        avg := r.read_i16(&dir.data)
+        weight := r.read_u16(&dir.data)
+        width := r.read_u16(&dir.data)
+        r.skip(54) // fsType..ulUnicodeRange4 + achVendID (2 + 11*2 + 2 + 10 + 16 + 4 = 54)
+        fs_sel := r.read_u16(&dir.data)
+        _ := r.read_u16(&dir.data) // usFirstCharIndex
+        _ := r.read_u16(&dir.data) // usLastCharIndex
+        typo_asc := r.read_i16(&dir.data)
+        typo_desc := r.read_i16(&dir.data)
+        typo_gap := r.read_i16(&dir.data)
+        win_asc := r.read_u16(&dir.data)
+        win_desc := r.read_u16(&dir.data)
+        if !r.ok { return out }
+        out.present = true
+        out.version = ver
+        out.avg_char_width = avg
+        out.weight_class = weight
+        out.width_class = width
+        out.fs_selection = fs_sel
+        out.typo_ascender = typo_asc
+        out.typo_descender = typo_desc
+        out.typo_line_gap = typo_gap
+        out.win_ascent = win_asc
+        out.win_descent = win_desc
+        if ver >= 2 && r.remaining() >= 12 {
+            r.skip(8) // ulCodePageRange1 + ulCodePageRange2
+            out.x_height = r.read_i16(&dir.data)
+            out.cap_height = r.read_i16(&dir.data)
+        }
+        out
+    }
+}
+
+pub struct PostTable {
+    present: bool,
+    italic_angle: f64,
+    underline_position: i32,
+    underline_thickness: i32,
+    is_fixed_pitch: bool,
+}
+
+impl PostTable {
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        mut out := Self {
+            present: false, italic_angle: 0.0,
+            underline_position: 0, underline_thickness: 0, is_fixed_pitch: false,
+        }
+        mut r := dir.table_reader("post")
+        if !r.ok { return out }
+        _ := r.read_u32(&dir.data) // format
+        italic := r.read_fixed(&dir.data)
+        upos := r.read_i16(&dir.data)
+        uthick := r.read_i16(&dir.data)
+        fixed := r.read_u32(&dir.data)
+        if !r.ok { return out }
+        out.present = true
+        out.italic_angle = italic
+        out.underline_position = upos
+        out.underline_thickness = uthick
+        out.is_fixed_pitch = fixed != 0
+        out
+    }
+}
+
+pub struct NameTable {
+    ok: bool,
+    platform_ids: []i32,
+    encoding_ids: []i32,
+    language_ids: []i32,
+    name_ids: []i32,
+    values: []string,
+}
+
+impl NameTable {
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        mut empty := Self {
+            ok: false, platform_ids: [], encoding_ids: [],
+            language_ids: [], name_ids: [], values: [],
+        }
+        table_off := dir.table_offset("name")
+        table_len := dir.table_length("name")
+        if table_off < 0 || table_len < 6 { return empty }
+        mut r := bin.Reader::slice(&dir.data, table_off, table_len)
+        _ := r.read_u16(&dir.data) // version
+        count := r.read_u16(&dir.data)
+        str_offset := r.read_u16(&dir.data)
+        if !r.ok || str_offset > table_len { return empty }
+        storage_abs := table_off + str_offset
+
+        mut pids: []i32 = []
+        mut eids: []i32 = []
+        mut lids: []i32 = []
+        mut nids: []i32 = []
+        mut vals: []string = []
+        for _ in 0..count {
+            pid := r.read_u16(&dir.data)
+            eid := r.read_u16(&dir.data)
+            lid := r.read_u16(&dir.data)
+            nid := r.read_u16(&dir.data)
+            slen := r.read_u16(&dir.data)
+            soff := r.read_u16(&dir.data)
+            if !r.ok { break }
+            abs_off := storage_abs + soff
+            if soff + slen > table_len - str_offset { continue }
+            mut decoded := ""
+            if pid == 0 || (pid == 3 && (eid == 1 || eid == 10 || eid == 0)) {
+                decoded = bin.decode_utf16be(&dir.data, abs_off, slen)
+            } else if pid == 1 && eid == 0 {
+                decoded = bin.decode_macroman(&dir.data, abs_off, slen)
+            } else {
+                continue
+            }
+            pids.push(pid)
+            eids.push(eid)
+            lids.push(lid)
+            nids.push(nid)
+            vals.push(move decoded)
+        }
+        Self {
+            ok: true, platform_ids: pids, encoding_ids: eids,
+            language_ids: lids, name_ids: nids, values: vals,
+        }
+    }
+
+    pub fn get(&self, name_id: i32) -> string {
+        // Priority: Windows US-English (PID 3, LID 0x0409), any Windows Unicode, Unicode PID 0, MacRoman PID 1.
+        mut win_any := -1
+        mut unicode_any := -1
+        mut mac_any := -1
+        for i in 0..self.name_ids.len {
+            if self.name_ids[i] != name_id { continue }
+            pid := self.platform_ids[i]
+            if pid == 3 {
+                if self.language_ids[i] == 1033 { return self.values[i].clone() }
+                if win_any < 0 { win_any = i }
+            } else if pid == 0 {
+                if unicode_any < 0 { unicode_any = i }
+            } else if pid == 1 {
+                if self.language_ids[i] == 0 && mac_any < 0 { mac_any = i }
+            }
+        }
+        if win_any >= 0 { return self.values[win_any].clone() }
+        if unicode_any >= 0 { return self.values[unicode_any].clone() }
+        if mac_any >= 0 { return self.values[mac_any].clone() }
+        ""
+    }
+
+    pub fn family(&self) -> string {
+        pref := self.get(16)
+        if pref.len > 0 { return pref }
+        self.get(1)
+    }
+
+    pub fn subfamily(&self) -> string {
+        pref := self.get(17)
+        if pref.len > 0 { return pref }
+        self.get(2)
+    }
+
+    pub fn full_name(&self) -> string { self.get(4) }
+    pub fn version(&self) -> string { self.get(5) }
+    pub fn postscript_name(&self) -> string { self.get(6) }
+}

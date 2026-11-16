@@ -1,0 +1,154 @@
+// OpenType color font support: `CPAL` palettes and `COLR` v0 layered color glyphs.
+import binary as bin
+import sfnt
+
+pub struct ColorLayers {
+    layer_gids: []i32,
+    palette_indices: []i32,
+    rgba: []u8, // 4 bytes per layer: R, G, B, A (for 0xFFFF foreground, defaults to 255,255,255,255)
+}
+
+pub struct ColorTable {
+    present: bool,
+    colr_version: i32,
+    num_palettes: i32,
+    num_palette_entries: i32,
+    // Flattened RGBA color entries [num_palettes * num_palette_entries * 4]
+    palette_rgba: []u8,
+    // COLR v0 sorted base glyphs -> layer range
+    base_gids: []i32,
+    first_layers: []i32,
+    num_layers: []i32,
+    layer_gids: []i32,
+    layer_palette_indices: []i32,
+}
+
+impl ColorTable {
+    pub fn empty() -> Self {
+        Self {
+            present: false, colr_version: 0, num_palettes: 0, num_palette_entries: 0,
+            palette_rgba: [], base_gids: [], first_layers: [], num_layers: [],
+            layer_gids: [], layer_palette_indices: [],
+        }
+    }
+
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        cpal_off := dir.table_offset("CPAL")
+        cpal_len := dir.table_length("CPAL")
+        colr_off := dir.table_offset("COLR")
+        colr_len := dir.table_length("COLR")
+        if cpal_off < 0 || cpal_len < 12 || colr_off < 0 || colr_len < 14 {
+            return Self::empty()
+        }
+
+        mut pr := bin.Reader::slice(&dir.data, cpal_off, cpal_len)
+        _ := pr.read_u16(&dir.data) // version
+        num_entries := pr.read_u16(&dir.data)
+        num_palettes := pr.read_u16(&dir.data)
+        num_colors := pr.read_u16(&dir.data)
+        colors_rel := pr.read_u32(&dir.data)
+        if !pr.ok || num_entries <= 0 || num_palettes <= 0 || i64(colors_rel) + i64(num_colors) * 4 > i64(cpal_len) {
+            return Self::empty()
+        }
+        mut pal_indices: []i32 = []
+        for _ in 0..num_palettes {
+            pal_indices.push(pr.read_u16(&dir.data))
+        }
+        if !pr.ok { return Self::empty() }
+
+        colors_abs := cpal_off + i32(colors_rel)
+        mut palette_rgba: []u8 = []
+        palette_rgba.reserve(num_palettes * num_entries * 4)
+        for p in 0..num_palettes {
+            base_idx := pal_indices[p]
+            for e in 0..num_entries {
+                ci := base_idx + e
+                if ci >= 0 && ci < num_colors {
+                    cpos := colors_abs + ci * 4
+                    // CPAL stores BGRA
+                    palette_rgba.push(dir.data[cpos + 2])
+                    palette_rgba.push(dir.data[cpos + 1])
+                    palette_rgba.push(dir.data[cpos])
+                    palette_rgba.push(dir.data[cpos + 3])
+                } else {
+                    palette_rgba.push(0); palette_rgba.push(0); palette_rgba.push(0); palette_rgba.push(255)
+                }
+            }
+        }
+
+        mut cr := bin.Reader::slice(&dir.data, colr_off, colr_len)
+        colr_ver := cr.read_u16(&dir.data)
+        num_base := cr.read_u16(&dir.data)
+        base_rel := cr.read_u32(&dir.data)
+        layer_rel := cr.read_u32(&dir.data)
+        num_layer := cr.read_u16(&dir.data)
+        if !cr.ok { return Self::empty() }
+
+        mut base_gids: []i32 = []
+        mut first_layers: []i32 = []
+        mut num_layers: []i32 = []
+        mut layer_gids: []i32 = []
+        mut layer_pal_idx: []i32 = []
+
+        if num_base > 0 && i64(base_rel) + i64(num_base) * 6 <= i64(colr_len) {
+            mut br := bin.Reader::slice(&dir.data, colr_off + i32(base_rel), num_base * 6)
+            for _ in 0..num_base {
+                base_gids.push(br.read_u16(&dir.data))
+                first_layers.push(br.read_u16(&dir.data))
+                num_layers.push(br.read_u16(&dir.data))
+            }
+        }
+        if num_layer > 0 && i64(layer_rel) + i64(num_layer) * 4 <= i64(colr_len) {
+            mut lr := bin.Reader::slice(&dir.data, colr_off + i32(layer_rel), num_layer * 4)
+            for _ in 0..num_layer {
+                layer_gids.push(lr.read_u16(&dir.data))
+                layer_pal_idx.push(lr.read_u16(&dir.data))
+            }
+        }
+
+        Self {
+            present: true, colr_version: colr_ver,
+            num_palettes: num_palettes, num_palette_entries: num_entries,
+            palette_rgba: palette_rgba,
+            base_gids: base_gids, first_layers: first_layers, num_layers: num_layers,
+            layer_gids: layer_gids, layer_palette_indices: layer_pal_idx,
+        }
+    }
+
+    pub fn lookup_v0(&self, gid: i32, palette: i32) -> ColorLayers {
+        mut out := ColorLayers { layer_gids: [], palette_indices: [], rgba: [] }
+        if !self.present || self.base_gids.len == 0 { return out }
+        mut lo := 0
+        mut hi := self.base_gids.len
+        mut found := -1
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            bg := self.base_gids[mid]
+            if bg == gid { found = mid; break }
+            if bg < gid { lo = mid + 1 } else { hi = mid }
+        }
+        if found < 0 { return out }
+        first := self.first_layers[found]
+        cnt := self.num_layers[found]
+        mut pal := palette
+        if pal < 0 || pal >= self.num_palettes { pal = 0 }
+        for i in 0..cnt {
+            idx := first + i
+            if idx < 0 || idx >= self.layer_gids.len { break }
+            lgid := self.layer_gids[idx]
+            pidx := self.layer_palette_indices[idx]
+            out.layer_gids.push(lgid)
+            out.palette_indices.push(pidx)
+            if pidx == 65535 || pidx >= self.num_palette_entries {
+                out.rgba.push(255); out.rgba.push(255); out.rgba.push(255); out.rgba.push(255)
+            } else {
+                off := (pal * self.num_palette_entries + pidx) * 4
+                out.rgba.push(self.palette_rgba[off])
+                out.rgba.push(self.palette_rgba[off + 1])
+                out.rgba.push(self.palette_rgba[off + 2])
+                out.rgba.push(self.palette_rgba[off + 3])
+            }
+        }
+        out
+    }
+}

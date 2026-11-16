@@ -1,0 +1,651 @@
+// Variable font support: `fvar`, `avar`, `ItemVariationStore`, `HVAR`, and `gvar`.
+import binary as bin
+import sfnt
+
+pub struct VariationAxis {
+    tag: string,
+    tag_u32: u32,
+    min_value: f64,
+    default_value: f64,
+    max_value: f64,
+    flags: i32,
+    name_id: i32,
+}
+
+pub struct FvarTable {
+    present: bool,
+    axis_tags: []string,
+    axis_tag_u32s: []u32,
+    axis_mins: []f64,
+    axis_defaults: []f64,
+    axis_maxs: []f64,
+    axis_flags: []i32,
+    axis_name_ids: []i32,
+    axis_count: i32,
+    instance_names: []i32,
+    instance_coords: []f64, // flat [instance * axis_count + axis]
+}
+
+impl FvarTable {
+    pub fn empty() -> Self {
+        Self {
+            present: false,
+            axis_tags: [], axis_tag_u32s: [], axis_mins: [], axis_defaults: [],
+            axis_maxs: [], axis_flags: [], axis_name_ids: [],
+            axis_count: 0, instance_names: [], instance_coords: [],
+        }
+    }
+
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        off := dir.table_offset("fvar")
+        length := dir.table_length("fvar")
+        if off < 0 || length < 16 { return Self::empty() }
+        mut r := bin.Reader::slice(&dir.data, off, length)
+        major := r.read_u16(&dir.data)
+        minor := r.read_u16(&dir.data)
+        axes_off := r.read_u16(&dir.data)
+        _ := r.read_u16(&dir.data) // reserved
+        axis_count := r.read_u16(&dir.data)
+        axis_size := r.read_u16(&dir.data)
+        inst_count := r.read_u16(&dir.data)
+        inst_size := r.read_u16(&dir.data)
+        if !r.ok || major != 1 || minor != 0 || axis_count <= 0 || axis_size < 20 {
+            return Self::empty()
+        }
+        if axes_off + axis_count * axis_size > length { return Self::empty() }
+
+        mut axis_tags: []string = []
+        mut axis_tag_u32s: []u32 = []
+        mut axis_mins: []f64 = []
+        mut axis_defaults: []f64 = []
+        mut axis_maxs: []f64 = []
+        mut axis_flags: []i32 = []
+        mut axis_name_ids: []i32 = []
+        for i in 0..axis_count {
+            mut ar := bin.Reader::slice(&dir.data, off + axes_off + i * axis_size, axis_size)
+            tag_u := ar.read_u32(&dir.data)
+            min_v := ar.read_fixed(&dir.data)
+            def_v := ar.read_fixed(&dir.data)
+            max_v := ar.read_fixed(&dir.data)
+            flags := ar.read_u16(&dir.data)
+            nid := ar.read_u16(&dir.data)
+            if !ar.ok { return Self::empty() }
+            axis_tags.push(bin.tag_to_string(tag_u))
+            axis_tag_u32s.push(tag_u)
+            axis_mins.push(min_v)
+            axis_defaults.push(def_v)
+            axis_maxs.push(max_v)
+            axis_flags.push(flags)
+            axis_name_ids.push(nid)
+        }
+
+        mut inst_names: []i32 = []
+        mut inst_coords: []f64 = []
+        inst_base := off + axes_off + axis_count * axis_size
+        min_inst_size := 4 + axis_count * 4
+        if inst_size >= min_inst_size && inst_base + inst_count * inst_size <= off + length {
+            for j in 0..inst_count {
+                mut ir := bin.Reader::slice(&dir.data, inst_base + j * inst_size, inst_size)
+                sub_nid := ir.read_u16(&dir.data)
+                _ := ir.read_u16(&dir.data) // flags
+                if !ir.ok { break }
+                inst_names.push(sub_nid)
+                for _ in 0..axis_count {
+                    inst_coords.push(ir.read_fixed(&dir.data))
+                }
+            }
+        }
+        Self {
+            present: true,
+            axis_tags: axis_tags, axis_tag_u32s: axis_tag_u32s, axis_mins: axis_mins,
+            axis_defaults: axis_defaults, axis_maxs: axis_maxs, axis_flags: axis_flags,
+            axis_name_ids: axis_name_ids,
+            axis_count: axis_count,
+            instance_names: inst_names, instance_coords: inst_coords,
+        }
+    }
+
+    pub fn axis_at(&self, index: i32) -> VariationAxis {
+        VariationAxis {
+            tag: self.axis_tags[index].clone(),
+            tag_u32: self.axis_tag_u32s[index],
+            min_value: self.axis_mins[index],
+            default_value: self.axis_defaults[index],
+            max_value: self.axis_maxs[index],
+            flags: self.axis_flags[index],
+            name_id: self.axis_name_ids[index],
+        }
+    }
+
+    pub fn default_coords(&self) -> []f64 {
+        mut out: []f64 = []
+        for i in 0..self.axis_defaults.len { out.push(self.axis_defaults[i]) }
+        out
+    }
+
+    pub fn find_axis(&self, tag: string) -> i32 {
+        for i in 0..self.axis_tags.len {
+            if self.axis_tags[i] == tag { return i }
+        }
+        -1
+    }
+}
+
+pub struct AvarTable {
+    present: bool,
+    seg_starts: []i32,
+    seg_counts: []i32,
+    from_coords: []f64,
+    to_coords: []f64,
+}
+
+impl AvarTable {
+    pub fn empty() -> Self {
+        Self { present: false, seg_starts: [], seg_counts: [], from_coords: [], to_coords: [] }
+    }
+
+    pub fn parse(dir: &sfnt.TableDirectory, expected_axes: i32) -> Self {
+        off := dir.table_offset("avar")
+        length := dir.table_length("avar")
+        if off < 0 || length < 8 || expected_axes <= 0 { return Self::empty() }
+        mut r := bin.Reader::slice(&dir.data, off, length)
+        major := r.read_u16(&dir.data)
+        minor := r.read_u16(&dir.data)
+        _ := r.read_u16(&dir.data) // reserved
+        axis_count := r.read_u16(&dir.data)
+        if !r.ok || major != 1 || minor != 0 || axis_count != expected_axes {
+            return Self::empty()
+        }
+        mut starts: []i32 = []
+        mut counts: []i32 = []
+        mut froms: []f64 = []
+        mut tos: []f64 = []
+        for _ in 0..axis_count {
+            pair_count := r.read_u16(&dir.data)
+            if !r.ok || r.remaining() < pair_count * 4 { return Self::empty() }
+            starts.push(froms.len)
+            counts.push(pair_count)
+            for _ in 0..pair_count {
+                froms.push(r.read_f2dot14(&dir.data))
+                tos.push(r.read_f2dot14(&dir.data))
+            }
+        }
+        Self {
+            present: true, seg_starts: starts, seg_counts: counts,
+            from_coords: froms, to_coords: tos,
+        }
+    }
+
+    pub fn map_axis(&self, axis: i32, value: f64) -> f64 {
+        if !self.present || axis < 0 || axis >= self.seg_counts.len { return value }
+        start := self.seg_starts[axis]
+        count := self.seg_counts[axis]
+        if count < 2 { return value }
+        if value <= self.from_coords[start] { return self.to_coords[start] }
+        if value >= self.from_coords[start + count - 1] { return self.to_coords[start + count - 1] }
+        for i in 1..count {
+            f1 := self.from_coords[start + i]
+            if value <= f1 {
+                f0 := self.from_coords[start + i - 1]
+                t0 := self.to_coords[start + i - 1]
+                t1 := self.to_coords[start + i]
+                if f1 == f0 { return t1 }
+                return t0 + (t1 - t0) * (value - f0) / (f1 - f0)
+            }
+        }
+        value
+    }
+}
+
+pub fn normalize_coords(fvar: &FvarTable, avar: &AvarTable, user_coords: &[]f64) -> []f64 {
+    mut out: []f64 = []
+    if !fvar.present { return out }
+    for i in 0..fvar.axis_count {
+        min_v := fvar.axis_mins[i]
+        def_v := fvar.axis_defaults[i]
+        max_v := fvar.axis_maxs[i]
+        mut v := def_v
+        if i < user_coords.len { v = user_coords[i] }
+        if v < min_v { v = min_v }
+        if v > max_v { v = max_v }
+        mut norm := 0.0
+        if v < def_v && def_v > min_v {
+            norm = -(def_v - v) / (def_v - min_v)
+        } else if v > def_v && max_v > def_v {
+            norm = (v - def_v) / (max_v - def_v)
+        }
+        if avar.present { norm = avar.map_axis(i, norm) }
+        if norm < -1.0 { norm = -1.0 }
+        if norm > 1.0 { norm = 1.0 }
+        out.push(norm)
+    }
+    out
+}
+
+// --- ItemVariationStore (shared by HVAR, VVAR, CFF2, GPOS) ---
+
+pub struct ItemVariationStore {
+    ok: bool,
+    axis_count: i32,
+    region_count: i32,
+    region_starts: []f64,
+    region_peaks: []f64,
+    region_ends: []f64,
+    data_offsets: []i32, // relative to start of ItemVariationStore
+    base_offset: i32,
+}
+
+impl ItemVariationStore {
+    pub fn empty() -> Self {
+        Self {
+            ok: false, axis_count: 0, region_count: 0,
+            region_starts: [], region_peaks: [], region_ends: [],
+            data_offsets: [], base_offset: 0,
+        }
+    }
+
+    pub fn parse(data: &[]u8, store_off: i32, max_len: i32) -> Self {
+        if store_off < 0 || max_len < 8 || store_off + max_len > data.len {
+            return Self::empty()
+        }
+        mut r := bin.Reader::slice(&data, store_off, max_len)
+        fmt := r.read_u16(&data)
+        reg_list_off := r.read_u32(&data)
+        data_count := r.read_u16(&data)
+        if !r.ok || fmt != 1 || i64(reg_list_off) + 4 > i64(max_len) {
+            return Self::empty()
+        }
+        mut data_offsets: []i32 = []
+        for _ in 0..data_count {
+            doff := r.read_u32(&data)
+            if !r.ok { return Self::empty() }
+            if doff == 0 { data_offsets.push(-1) }
+            else if i64(doff) < i64(max_len) { data_offsets.push(i32(doff)) }
+            else { data_offsets.push(-1) }
+        }
+
+        mut rr := bin.Reader::slice(&data, store_off + i32(reg_list_off), max_len - i32(reg_list_off))
+        axis_count := rr.read_u16(&data)
+        region_count := rr.read_u16(&data)
+        if !rr.ok || axis_count <= 0 || rr.remaining() < region_count * axis_count * 6 {
+            return Self::empty()
+        }
+        mut rs: []f64 = []
+        mut rp: []f64 = []
+        mut re: []f64 = []
+        total := region_count * axis_count
+        rs.reserve(total); rp.reserve(total); re.reserve(total)
+        for _ in 0..total {
+            rs.push(rr.read_f2dot14(&data))
+            rp.push(rr.read_f2dot14(&data))
+            re.push(rr.read_f2dot14(&data))
+        }
+        Self {
+            ok: true, axis_count: axis_count, region_count: region_count,
+            region_starts: rs, region_peaks: rp, region_ends: re,
+            data_offsets: data_offsets, base_offset: store_off,
+        }
+    }
+
+    pub fn region_scalars(&self, norm_coords: &[]f64) -> []f64 {
+        mut scalars: []f64 = []
+        if !self.ok { return scalars }
+        scalars.reserve(self.region_count)
+        for reg in 0..self.region_count {
+            mut scalar := 1.0
+            for ax in 0..self.axis_count {
+                idx := reg * self.axis_count + ax
+                start := self.region_starts[idx]
+                peak := self.region_peaks[idx]
+                end := self.region_ends[idx]
+                mut v := 0.0
+                if ax < norm_coords.len { v = norm_coords[ax] }
+                if peak == 0.0 { continue }
+                if start > peak || peak > end || (start < 0.0 && end > 0.0) {
+                    scalar = 0.0; break
+                }
+                if v < start || v > end {
+                    scalar = 0.0; break
+                }
+                if v < peak {
+                    scalar = scalar * (v - start) / (peak - start)
+                } else if v > peak {
+                    scalar = scalar * (end - v) / (end - peak)
+                }
+            }
+            scalars.push(scalar)
+        }
+        scalars
+    }
+
+    pub fn delta_at(&self, data: &[]u8, outer: i32, inner: i32, scalars: &[]f64) -> f64 {
+        if !self.ok || outer < 0 || outer >= self.data_offsets.len || inner < 0 { return 0.0 }
+        rel := self.data_offsets[outer]
+        if rel < 0 { return 0.0 }
+        abs := self.base_offset + rel
+        if abs + 6 > data.len { return 0.0 }
+        item_count := bin.peek_u16(&data, abs)
+        word_delta_raw := bin.peek_u16(&data, abs + 2)
+        word_deltas := word_delta_raw.bit_and(32767)
+        long_words := word_delta_raw.bit_and(32768) != 0
+        reg_idx_count := bin.peek_u16(&data, abs + 4)
+        if inner >= item_count || abs + 6 + reg_idx_count * 2 > data.len { return 0.0 }
+        row_size := if long_words {
+            word_deltas * 4 + (reg_idx_count - word_deltas) * 2
+        } else {
+            word_deltas * 2 + (reg_idx_count - word_deltas)
+        }
+        row_off := abs + 6 + reg_idx_count * 2 + inner * row_size
+        if row_off + row_size > data.len { return 0.0 }
+        mut dr := bin.Reader::slice(&data, row_off, row_size)
+        mut sum := 0.0
+        for k in 0..reg_idx_count {
+            reg_idx := bin.peek_u16(&data, abs + 6 + k * 2)
+            mut d := 0.0
+            if k < word_deltas {
+                if long_words { d = f64(dr.read_i32(&data)) }
+                else { d = f64(dr.read_i16(&data)) }
+            } else {
+                if long_words { d = f64(dr.read_i16(&data)) }
+                else { d = f64(dr.read_i8(&data)) }
+            }
+            if reg_idx < scalars.len {
+                sum += d * scalars[reg_idx]
+            }
+        }
+        sum
+    }
+}
+
+// --- HVAR ---
+
+pub struct HvarTable {
+    present: bool,
+    ivs: ItemVariationStore,
+    adv_map_off: i32,
+}
+
+impl HvarTable {
+    pub fn empty() -> Self {
+        Self { present: false, ivs: ItemVariationStore::empty(), adv_map_off: -1 }
+    }
+
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        off := dir.table_offset("HVAR")
+        length := dir.table_length("HVAR")
+        if off < 0 || length < 20 { return Self::empty() }
+        mut r := bin.Reader::slice(&dir.data, off, length)
+        major := r.read_u16(&dir.data)
+        minor := r.read_u16(&dir.data)
+        ivs_rel := r.read_u32(&dir.data)
+        adv_rel := r.read_u32(&dir.data)
+        if !r.ok || major != 1 || minor != 0 || i64(ivs_rel) >= i64(length) {
+            return Self::empty()
+        }
+        ivs := ItemVariationStore::parse(&dir.data, off + i32(ivs_rel), length - i32(ivs_rel))
+        if !ivs.ok { return Self::empty() }
+        mut adv_off := -1
+        if adv_rel > 0 && i64(adv_rel) < i64(length) {
+            adv_off = off + i32(adv_rel)
+        }
+        Self { present: true, ivs: ivs, adv_map_off: adv_off }
+    }
+
+    pub fn advance_delta(&self, data: &[]u8, gid: i32, norm_coords: &[]f64) -> f64 {
+        if !self.present || gid < 0 { return 0.0 }
+        scalars := self.ivs.region_scalars(&norm_coords)
+        mut outer := 0
+        mut inner := gid
+        if self.adv_map_off >= 0 && self.adv_map_off + 4 <= data.len {
+            fmt := i32(data[self.adv_map_off])
+            entry_fmt := i32(data[self.adv_map_off + 1])
+            mut map_count := 0
+            mut entry_off := 0
+            if fmt == 0 {
+                map_count = bin.peek_u16(&data, self.adv_map_off + 2)
+                entry_off = self.adv_map_off + 4
+            } else if fmt == 1 && self.adv_map_off + 6 <= data.len {
+                map_count = i32(bin.peek_u32(&data, self.adv_map_off + 2))
+                entry_off = self.adv_map_off + 6
+            }
+            if map_count > 0 {
+                mut idx := gid
+                if idx >= map_count { idx = map_count - 1 }
+                inner_bits := entry_fmt.bit_and(15) + 1
+                entry_size := entry_fmt.shr(4).bit_and(3) + 1
+                pos := entry_off + idx * entry_size
+                if pos + entry_size <= data.len {
+                    mut val: u32 = 0
+                    for b in 0..entry_size { val = val.shl(8).bit_or(u32(data[pos + b])) }
+                    outer = i32(val.shr(inner_bits))
+                    inner_mask := u32(1).shl(inner_bits) - 1
+                    inner = i32(val.bit_and(inner_mask))
+                }
+            }
+        }
+        self.ivs.delta_at(&data, outer, inner, &scalars)
+    }
+}
+
+// --- gvar (TrueType glyph variation deltas) ---
+
+pub struct GvarTable {
+    present: bool,
+    axis_count: i32,
+    glyph_count: i32,
+    shared_tuples: []f64,
+    shared_tuple_count: i32,
+    data_abs_offset: i32,
+    glyph_offsets: []i32,
+}
+
+impl GvarTable {
+    pub fn empty() -> Self {
+        Self {
+            present: false, axis_count: 0, glyph_count: 0,
+            shared_tuples: [], shared_tuple_count: 0, data_abs_offset: 0, glyph_offsets: [],
+        }
+    }
+
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        off := dir.table_offset("gvar")
+        length := dir.table_length("gvar")
+        if off < 0 || length < 20 { return Self::empty() }
+        mut r := bin.Reader::slice(&dir.data, off, length)
+        major := r.read_u16(&dir.data)
+        minor := r.read_u16(&dir.data)
+        axis_count := r.read_u16(&dir.data)
+        shared_count := r.read_u16(&dir.data)
+        shared_off := r.read_u32(&dir.data)
+        glyph_count := r.read_u16(&dir.data)
+        flags := r.read_u16(&dir.data)
+        data_off := r.read_u32(&dir.data)
+        if !r.ok || major != 1 || minor != 0 || axis_count <= 0 || glyph_count <= 0 {
+            return Self::empty()
+        }
+        long_offsets := flags.bit_and(1) != 0
+        mut glyph_offsets: []i32 = []
+        glyph_offsets.reserve(glyph_count + 1)
+        for _ in 0..(glyph_count + 1) {
+            if long_offsets {
+                glyph_offsets.push(i32(r.read_u32(&dir.data)))
+            } else {
+                glyph_offsets.push(r.read_u16(&dir.data) * 2)
+            }
+        }
+        if !r.ok { return Self::empty() }
+
+        mut shared_tuples: []f64 = []
+        if shared_count > 0 && i64(shared_off) + i64(shared_count) * i64(axis_count) * 2 <= i64(length) {
+            mut sr := bin.Reader::slice(&dir.data, off + i32(shared_off), shared_count * axis_count * 2)
+            for _ in 0..(shared_count * axis_count) {
+                shared_tuples.push(sr.read_f2dot14(&dir.data))
+            }
+        }
+
+        Self {
+            present: true, axis_count: axis_count, glyph_count: glyph_count,
+            shared_tuples: shared_tuples, shared_tuple_count: shared_count,
+            data_abs_offset: off + i32(data_off), glyph_offsets: glyph_offsets,
+        }
+    }
+
+    pub fn glyph_deltas(&self, data: &[]u8, gid: i32, num_points: i32, norm_coords: &[]f64,
+        dx_out: &mut []f64, dy_out: &mut []f64) {
+        dx_out.clear()
+        dy_out.clear()
+        total_pts := num_points + 4 // includes 4 phantom points
+        for _ in 0..total_pts {
+            dx_out.push(0.0)
+            dy_out.push(0.0)
+        }
+        if !self.present || gid < 0 || gid >= self.glyph_count || norm_coords.len == 0 {
+            return
+        }
+        start := self.glyph_offsets[gid]
+        end := self.glyph_offsets[gid + 1]
+        if end <= start { return }
+        abs := self.data_abs_offset + start
+        span := end - start
+        if abs < 0 || span < 4 || abs + span > data.len { return }
+
+        mut r := bin.Reader::slice(&data, abs, span)
+        tvc_raw := r.read_u16(&data)
+        tuple_count := tvc_raw.bit_and(4095)
+        has_shared_pts := tvc_raw.bit_and(32768) != 0
+        serial_off := r.read_u16(&data)
+        if !r.ok || tuple_count == 0 || serial_off > span { return }
+
+        mut serial_r := bin.Reader::slice(&data, abs + serial_off, span - serial_off)
+        mut shared_pts: []i32 = []
+        if has_shared_pts {
+            shared_pts = read_packed_points(&mut serial_r, &data, total_pts)
+        }
+
+        for _ in 0..tuple_count {
+            var_data_size := r.read_u16(&data)
+            tidx := r.read_u16(&data)
+            if !r.ok { break }
+            mut peak: []f64 = []
+            if tidx.bit_and(32768) != 0 {
+                for _ in 0..self.axis_count { peak.push(r.read_f2dot14(&data)) }
+            } else {
+                idx := tidx.bit_and(4095)
+                for a in 0..self.axis_count {
+                    pos := idx * self.axis_count + a
+                    if pos < self.shared_tuples.len { peak.push(self.shared_tuples[pos]) }
+                    else { peak.push(0.0) }
+                }
+            }
+            mut inter_start: []f64 = []
+            mut inter_end: []f64 = []
+            has_inter := tidx.bit_and(16384) != 0
+            if has_inter {
+                for _ in 0..self.axis_count { inter_start.push(r.read_f2dot14(&data)) }
+                for _ in 0..self.axis_count { inter_end.push(r.read_f2dot14(&data)) }
+            }
+            has_private_pts := tidx.bit_and(8192) != 0
+            if !r.ok { break }
+
+            scalar := tuple_scalar(self.axis_count, &peak, has_inter, &inter_start, &inter_end, &norm_coords)
+            tuple_start := serial_r.pos
+            if scalar == 0.0 || var_data_size == 0 {
+                serial_r.seek(tuple_start + var_data_size)
+                continue
+            }
+            mut pts: []i32 = []
+            if has_private_pts {
+                pts = read_packed_points(&mut serial_r, &data, total_pts)
+            } else if has_shared_pts {
+                pts = shared_pts.clone()
+            }
+            count := if pts.len == 0 { total_pts } else { pts.len }
+            dxs := read_packed_deltas(&mut serial_r, &data, count)
+            dys := read_packed_deltas(&mut serial_r, &data, count)
+            for k in 0..count {
+                p := if pts.len == 0 { k } else { pts[k] }
+                if p >= 0 && p < total_pts && k < dxs.len && k < dys.len {
+                    dx_out[p] = dx_out[p] + dxs[k] * scalar
+                    dy_out[p] = dy_out[p] + dys[k] * scalar
+                }
+            }
+            serial_r.seek(tuple_start + var_data_size)
+        }
+    }
+}
+
+fn tuple_scalar(axis_count: i32, peak: &[]f64, has_inter: bool,
+    inter_start: &[]f64, inter_end: &[]f64, norm_coords: &[]f64) -> f64 {
+    mut s := 1.0
+    for a in 0..axis_count {
+        p := if a < peak.len { peak[a] } else { 0.0 }
+        if p == 0.0 { continue }
+        v := if a < norm_coords.len { norm_coords[a] } else { 0.0 }
+        if v == p { continue }
+        if !has_inter {
+            if v == 0.0 || (p > 0.0 && (v < 0.0 || v > p)) || (p < 0.0 && (v > 0.0 || v < p)) {
+                return 0.0
+            }
+            s = s * (v / p)
+        } else {
+            st := inter_start[a]
+            en := inter_end[a]
+            if v <= st || v >= en { return 0.0 }
+            if v < p { s = s * (v - st) / (p - st) }
+            else { s = s * (en - v) / (en - p) }
+        }
+    }
+    s
+}
+
+fn read_packed_points(r: &mut bin.Reader, data: &[]u8, total_pts: i32) -> []i32 {
+    mut out: []i32 = []
+    if !r.ok { return out }
+    b0 := r.read_u8(&data)
+    if !r.ok || b0 == 0 { return out }
+    mut count := b0.bit_and(127)
+    if b0.bit_and(128) != 0 {
+        b1 := r.read_u8(&data)
+        count = count.shl(8).bit_or(b1)
+    }
+    mut cur := 0
+    while out.len < count && r.ok {
+        ctrl := r.read_u8(&data)
+        words := ctrl.bit_and(128) != 0
+        run_len := ctrl.bit_and(127) + 1
+        for _ in 0..run_len {
+            if out.len >= count { break }
+            delta := if words { r.read_u16(&data) } else { r.read_u8(&data) }
+            cur += delta
+            if cur >= 0 && cur < total_pts { out.push(cur) }
+            else { out.push(-1) }
+        }
+    }
+    out
+}
+
+fn read_packed_deltas(r: &mut bin.Reader, data: &[]u8, count: i32) -> []f64 {
+    mut out: []f64 = []
+    out.reserve(count)
+    while out.len < count && r.ok {
+        ctrl := r.read_u8(&data)
+        run_len := ctrl.bit_and(63) + 1
+        if ctrl.bit_and(128) != 0 {
+            for _ in 0..run_len {
+                if out.len >= count { break }
+                out.push(0.0)
+            }
+        } else if ctrl.bit_and(64) != 0 {
+            for _ in 0..run_len {
+                if out.len >= count { break }
+                out.push(f64(r.read_i16(&data)))
+            }
+        } else {
+            for _ in 0..run_len {
+                if out.len >= count { break }
+                out.push(f64(r.read_i8(&data)))
+            }
+        }
+    }
+    out
+}

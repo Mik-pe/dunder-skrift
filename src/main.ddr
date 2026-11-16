@@ -1,0 +1,226 @@
+// `skrift` CLI for inspecting and rasterizing TTF, OTF (CFF/CFF2), TTC, WOFF1,
+// variable fonts, kerning, and color layers.
+import font
+import raster
+import std.bytes as bytes
+import std.parse as parse
+import std.text as text
+import sys
+
+fn usage() {
+    print("dunder-skrift (skrift) - Pure Dunder font reader & rasterizer")
+    print("Usage:")
+    print("  skrift info <font-file> [--face N]")
+    print("  skrift axes <font-file> [--face N]")
+    print("  skrift glyph <font-file> <char|U+XXXX> [--size PX] [--face N] [--wght V] [--axis TAG=V]")
+    print("  skrift render <font-file> <text> [--size PX] [--face N] [--wght V] [--axis TAG=V]")
+    print("  skrift kern <font-file> <left-char> <right-char> [--face N]")
+    print("  skrift layers <font-file> <char|U+XXXX> [--face N]")
+}
+
+struct ParsedDecimal { ok: bool, value: f64 }
+
+fn parse_decimal(arg: string) -> ParsedDecimal {
+    dot := text.find(arg, ".")
+    if dot < 0 {
+        p := parse.integer(arg)
+        return ParsedDecimal { ok: p.ok, value: f64(p.value) }
+    }
+    whole_s := if dot == 0 { "0" } else { arg[0..dot] }
+    frac_s := arg[dot + 1..arg.len]
+    if frac_s.len == 0 {
+        p := parse.integer(whole_s)
+        return ParsedDecimal { ok: p.ok, value: f64(p.value) }
+    }
+    wp := parse.integer(whole_s)
+    fp := parse.integer(frac_s)
+    if !wp.ok || !fp.ok || fp.value < 0 { return ParsedDecimal { ok: false, value: 0.0 } }
+    mut scale := 1.0
+    for _ in 0..frac_s.len { scale = scale * 10.0 }
+    sign := if text.starts_with(arg, "-") { -1.0 } else { 1.0 }
+    abs_w := if wp.value < 0 { f64(-wp.value) } else { f64(wp.value) }
+    ParsedDecimal { ok: true, value: sign * (abs_w + f64(fp.value) / scale) }
+}
+
+fn hex_cp(cp: i32) -> string {
+    digits := "0123456789ABCDEF"
+    mut v := cp
+    mut out := ""
+    while v > 0 || out.len < 4 {
+        d := v % 16
+        out = digits[d..d + 1] + out
+        v = v / 16
+    }
+    "U+" + out
+}
+
+fn parse_codepoint(arg: string) -> i32 {
+    if text.starts_with(arg, "U+") || text.starts_with(arg, "u+") {
+        hex := parse.hex(arg[2..arg.len])
+        if hex.ok && hex.value >= 0 && hex.value <= 0x10FFFF { return i32(hex.value) }
+        return -1
+    }
+    rs := arg.runes()
+    if rs.len == 1 { return i32(rs[0]) }
+    -1
+}
+
+fn render_ascii_canvas(w: i32, h: i32, pixels: &[]u8) {
+    if w <= 0 || h <= 0 { print("(empty)"); return }
+    ramp := " .:-=+*#%@"
+    for y in 0..h {
+        mut line := ""
+        for x in 0..w {
+            v := i32(pixels[y * w + x])
+            idx := (v * 9) / 255
+            line = line + ramp[idx..idx + 1]
+        }
+        print(line)
+    }
+}
+
+fn main() -> i32 {
+    argc := sys.arg_count()
+    if argc < 3 || sys.arg(1) == "--help" || sys.arg(1) == "-h" {
+        usage()
+        return if argc >= 2 && (sys.arg(1) == "--help" || sys.arg(1) == "-h") { 0 } else { 2 }
+    }
+
+    cmd := sys.arg(1)
+    path := sys.arg(2)
+    mut face_index := 0
+    mut size_px := 20.0
+    mut axis_tags: []string = []
+    mut axis_vals: []f64 = []
+    mut positional: []string = []
+
+    mut i := 3
+    while i < argc {
+        a := sys.arg(i)
+        if a == "--face" && i + 1 < argc {
+            i += 1
+            p := parse.integer(sys.arg(i))
+            if !p.ok || p.value < 0 { _ := sys.eprint("invalid --face index"); return 2 }
+            face_index = i32(p.value)
+        } else if a == "--size" && i + 1 < argc {
+            i += 1
+            p := parse.integer(sys.arg(i))
+            if !p.ok || p.value <= 0 { _ := sys.eprint("invalid --size"); return 2 }
+            size_px = f64(p.value)
+        } else if a == "--wght" && i + 1 < argc {
+            i += 1
+            p := parse.integer(sys.arg(i))
+            if !p.ok { _ := sys.eprint("invalid --wght"); return 2 }
+            axis_tags.push("wght")
+            axis_vals.push(f64(p.value))
+        } else if a == "--axis" && i + 1 < argc {
+            i += 1
+            spec := sys.arg(i)
+            eq := text.find(spec, "=")
+            if eq != 4 || eq + 1 >= spec.len {
+                _ := sys.eprint("invalid --axis format; expected TAG=VALUE (e.g. wght=700)")
+                return 2
+            }
+            dp := parse_decimal(spec[eq + 1..spec.len])
+            if !dp.ok { _ := sys.eprint("invalid --axis numeric value"); return 2 }
+            axis_tags.push(spec[0..4])
+            axis_vals.push(dp.value)
+        } else if text.starts_with(a, "--") {
+            _ := sys.eprint("unknown option: " + a)
+            return 2
+        } else {
+            positional.push(move a)
+        }
+        i += 1
+    }
+
+    mut f := font.Face::from_file(path, face_index)
+    if !f.ok {
+        _ := sys.eprint("skrift error: " + f.error)
+        return 1
+    }
+    f.set_pixel_size(size_px)
+    for ai in 0..axis_tags.len {
+        _ := f.set_axis(axis_tags[ai], axis_vals[ai])
+    }
+    m := f.metrics()
+
+    if cmd == "info" {
+        kind := if m.is_cff2 { "OpenType CFF2" } else if m.is_cff { "OpenType CFF" } else { "TrueType" }
+        print(f"Family:      {m.family}")
+        print(f"Subfamily:   {m.subfamily}")
+        print(f"Full name:   {m.full_name}")
+        print(f"PostScript:  {m.postscript_name}")
+        print(f"Version:     {m.version}")
+        print(f"Format:      {kind} (faces={m.face_count}, face={m.face_index})")
+        print(f"Glyphs:      {m.num_glyphs}, UPEM={m.units_per_em}")
+        print(f"Ascent/Desc: {m.ascender} / {m.descender} (lineGap={m.line_gap})")
+        print(f"Typo A/D:    {m.typo_ascender} / {m.typo_descender} (xHeight={m.x_height}, capHeight={m.cap_height})")
+        print(f"Features:    variable={m.is_variable}, color={m.has_color}, kerning={m.has_kerning}, fixed={m.is_fixed_pitch}")
+        return 0
+    }
+
+    if cmd == "axes" {
+        if !f.fvar_table.present {
+            print("No fvar variation axes in this font.")
+            return 0
+        }
+        for ai in 0..f.fvar_table.axis_count {
+            ax := f.fvar_table.axis_at(ai)
+            print(f"Axis '{ax.tag}': min={ax.min_value}, default={ax.default_value}, max={ax.max_value}")
+        }
+        return 0
+    }
+
+    if cmd == "glyph" {
+        if positional.len < 1 { _ := sys.eprint("usage: skrift glyph <font> <char|U+XXXX>"); return 2 }
+        cp := parse_codepoint(positional[0])
+        if cp < 0 { _ := sys.eprint("invalid codepoint argument"); return 2 }
+        gid := f.glyph_index(cp)
+        gm := f.glyph_metrics(gid)
+        out := f.glyph_outline_units(gid)
+        bm := f.render_glyph(gid)
+        print(f"Codepoint {hex_cp(cp)} -> glyph #{gid} (segments={out.segment_count()}, contours={out.contour_count()})")
+        print(f"Metrics@{size_px}px: advance={gm.advance_width}, lsb={gm.left_side_bearing}, bitmap={bm.width}x{bm.height} (left={bm.left}, top={bm.top})")
+        print(bm.ascii_art())
+        return 0
+    }
+
+    if cmd == "render" {
+        if positional.len < 1 { _ := sys.eprint("usage: skrift render <font> <text>"); return 2 }
+        rt := f.render_text(positional[0])
+        if !rt.ok { _ := sys.eprint(rt.error); return 1 }
+        print(f"Rendered '{positional[0]}' -> {rt.width}x{rt.height}, baseline={rt.baseline}, advance={rt.advance_x}")
+        render_ascii_canvas(rt.width, rt.height, &rt.pixels)
+        return 0
+    }
+
+    if cmd == "kern" {
+        if positional.len < 2 { _ := sys.eprint("usage: skrift kern <font> <left> <right>"); return 2 }
+        c1 := parse_codepoint(positional[0])
+        c2 := parse_codepoint(positional[1])
+        if c1 < 0 || c2 < 0 { _ := sys.eprint("invalid codepoints"); return 2 }
+        g1 := f.glyph_index(c1)
+        g2 := f.glyph_index(c2)
+        k := f.kern_units(g1, g2)
+        print(f"Kern ({positional[0]} #{g1}, {positional[1]} #{g2}) = {k} font units")
+        return 0
+    }
+
+    if cmd == "layers" {
+        if positional.len < 1 { _ := sys.eprint("usage: skrift layers <font> <char|U+XXXX>"); return 2 }
+        cp := parse_codepoint(positional[0])
+        if cp < 0 { _ := sys.eprint("invalid codepoint"); return 2 }
+        gid := f.glyph_index(cp)
+        layers := f.color_layers(gid, 0)
+        print(f"Glyph #{gid} COLR v0 layers: {layers.layer_gids.len}")
+        for li in 0..layers.layer_gids.len {
+            off := li * 4
+            print(f"  layer {li}: gid={layers.layer_gids[li]}, rgba=({layers.rgba[off]}, {layers.rgba[off+1]}, {layers.rgba[off+2]}, {layers.rgba[off+3]})")
+        }
+        return 0
+    }
+
+    _ := sys.eprint("unknown subcommand: " + cmd)
+    2
+}

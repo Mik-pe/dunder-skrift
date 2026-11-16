@@ -1,0 +1,311 @@
+// TrueType `loca` and `glyf` parser:
+// supports short (16-bit * 2) and long (32-bit) loca tables, simple contours
+// with implicit on-curve midpoint reconstruction, composite glyphs, and
+// optional variable-font point deltas (gvar).
+import binary as bin
+import outline
+import sfnt
+
+pub struct LocaTable {
+    ok: bool,
+    error: string,
+    offsets: []i32,
+}
+
+impl LocaTable {
+    pub fn parse(dir: &sfnt.TableDirectory, num_glyphs: i32, index_to_loc_format: i32) -> Self {
+        mut r := dir.table_reader("loca")
+        if !r.ok { return Self { ok: false, error: r.error.clone(), offsets: [] } }
+        glyf_len := dir.table_length("glyf")
+        if glyf_len < 0 { return Self { ok: false, error: "missing glyf table", offsets: [] } }
+        need := num_glyphs + 1
+        mut offsets: []i32 = []
+        offsets.reserve(need)
+        if index_to_loc_format == 0 {
+            if r.remaining() < need * 2 {
+                return Self { ok: false, error: "truncated short loca table", offsets: [] }
+            }
+            for _ in 0..need {
+                off := r.read_u16(&dir.data) * 2
+                if off > glyf_len { return Self { ok: false, error: "loca offset exceeds glyf length", offsets: [] } }
+                offsets.push(off)
+            }
+        } else {
+            if r.remaining() < need * 4 {
+                return Self { ok: false, error: "truncated long loca table", offsets: [] }
+            }
+            for _ in 0..need {
+                off_u := r.read_u32(&dir.data)
+                if i64(off_u) > i64(glyf_len) {
+                    return Self { ok: false, error: "loca offset exceeds glyf length", offsets: [] }
+                }
+                offsets.push(i32(off_u))
+            }
+        }
+        Self { ok: true, error: "", offsets: offsets }
+    }
+}
+
+pub fn decode_glyph(dir: &sfnt.TableDirectory, loca: &LocaTable, gid: i32) -> outline.Outline {
+    empty_deltas: []f64 = []
+    decode_glyph_with_deltas(&dir, &loca, gid, &empty_deltas, &empty_deltas, 0)
+}
+
+pub fn decode_glyph_with_deltas(dir: &sfnt.TableDirectory, loca: &LocaTable, gid: i32,
+    delta_x: &[]f64, delta_y: &[]f64, depth: i32) -> outline.Outline {
+    if depth > 16 {
+        return outline.Outline::fail("composite glyph recursion limit exceeded")
+    }
+    if gid < 0 || gid + 1 >= loca.offsets.len {
+        return outline.Outline::fail("glyph ID out of range")
+    }
+    glyf_off := dir.table_offset("glyf")
+    if glyf_off < 0 {
+        return outline.Outline::fail("missing glyf table")
+    }
+    start := loca.offsets[gid]
+    end := loca.offsets[gid + 1]
+    if end < start {
+        return outline.Outline::fail("invalid loca glyph span")
+    }
+    if start == end {
+        return outline.Outline::new()
+    }
+    if end - start < 10 {
+        return outline.Outline::fail("truncated glyf record")
+    }
+    mut r := bin.Reader::slice(&dir.data, glyf_off + start, end - start)
+    num_contours := r.read_i16(&dir.data)
+    _ := r.read_i16(&dir.data) // xMin
+    _ := r.read_i16(&dir.data) // yMin
+    _ := r.read_i16(&dir.data) // xMax
+    _ := r.read_i16(&dir.data) // yMax
+    if !r.ok { return outline.Outline::fail("truncated glyf header") }
+
+    if num_contours >= 0 {
+        return decode_simple(&mut r, &dir.data, num_contours, &delta_x, &delta_y)
+    }
+    decode_composite(&mut r, &dir, &loca, depth)
+}
+
+fn decode_simple(r: &mut bin.Reader, data: &[]u8, num_contours: i32, delta_x: &[]f64, delta_y: &[]f64) -> outline.Outline {
+    if num_contours == 0 {
+        return outline.Outline::new()
+    }
+    mut end_pts: []i32 = []
+    end_pts.reserve(num_contours)
+    for _ in 0..num_contours {
+        ep := r.read_u16(&data)
+        if !r.ok { return outline.Outline::fail("truncated glyf endPtsOfContours") }
+        end_pts.push(ep)
+    }
+    num_points := end_pts[num_contours - 1] + 1
+    if num_points <= 0 || num_points > 65536 {
+        return outline.Outline::fail("invalid glyf point count")
+    }
+    instr_len := r.read_u16(&data)
+    r.skip(instr_len)
+    if !r.ok { return outline.Outline::fail("truncated glyf instructions") }
+
+    mut flags: []i32 = []
+    flags.reserve(num_points)
+    while flags.len < num_points {
+        f := r.read_u8(&data)
+        if !r.ok { return outline.Outline::fail("truncated glyf flags") }
+        flags.push(f)
+        if f.bit_and(8) != 0 {
+            rep := r.read_u8(&data)
+            if !r.ok || flags.len + rep > num_points {
+                return outline.Outline::fail("invalid glyf repeat flag")
+            }
+            for _ in 0..rep { flags.push(f) }
+        }
+    }
+
+    mut xs: []f64 = []
+    mut ys: []f64 = []
+    xs.reserve(num_points)
+    ys.reserve(num_points)
+
+    mut cur_x := 0
+    for i in 0..num_points {
+        f := flags[i]
+        mut dx := 0
+        if f.bit_and(2) != 0 {
+            mag := r.read_u8(&data)
+            if f.bit_and(16) != 0 { dx = mag } else { dx = -mag }
+        } else if f.bit_and(16) == 0 {
+            dx = r.read_i16(&data)
+        }
+        if !r.ok { return outline.Outline::fail("truncated glyf x-coordinates") }
+        cur_x += dx
+        mut fx := f64(cur_x)
+        if i < delta_x.len { fx += delta_x[i] }
+        xs.push(fx)
+    }
+
+    mut cur_y := 0
+    for i in 0..num_points {
+        f := flags[i]
+        mut dy := 0
+        if f.bit_and(4) != 0 {
+            mag := r.read_u8(&data)
+            if f.bit_and(32) != 0 { dy = mag } else { dy = -mag }
+        } else if f.bit_and(32) == 0 {
+            dy = r.read_i16(&data)
+        }
+        if !r.ok { return outline.Outline::fail("truncated glyf y-coordinates") }
+        cur_y += dy
+        mut fy := f64(cur_y)
+        if i < delta_y.len { fy += delta_y[i] }
+        ys.push(fy)
+    }
+
+    mut out := outline.Outline::new()
+    mut c_start := 0
+    for c in 0..num_contours {
+        c_end := end_pts[c] + 1
+        if c_end <= c_start || c_end > num_points {
+            return outline.Outline::fail("invalid contour endpoint in glyf")
+        }
+        emit_truetype_contour(&mut out, &xs, &ys, &flags, c_start, c_end)
+        c_start = c_end
+    }
+    out
+}
+
+fn emit_truetype_contour(out: &mut outline.Outline, xs: &[]f64, ys: &[]f64, flags: &[]i32, start: i32, end: i32) {
+    n := end - start
+    if n <= 0 { return }
+    mut first_on := -1
+    for i in 0..n {
+        if flags[start + i].bit_and(1) != 0 {
+            first_on = i
+            break
+        }
+    }
+
+    mut sx := 0.0
+    mut sy := 0.0
+    mut cursor := 0
+    if first_on >= 0 {
+        idx := start + first_on
+        sx = xs[idx]; sy = ys[idx]
+        cursor = (first_on + 1) % n
+    } else {
+        // Every point in the contour is off-curve; start at midpoint between last and first.
+        last := start + n - 1
+        sx = 0.5 * (xs[last] + xs[start])
+        sy = 0.5 * (ys[last] + ys[start])
+        cursor = 0
+    }
+    out.move_to(sx, sy)
+
+    mut has_off := false
+    mut off_x := 0.0
+    mut off_y := 0.0
+    for _ in 0..n {
+        p := start + cursor
+        px := xs[p]
+        py := ys[p]
+        on_curve := flags[p].bit_and(1) != 0
+        if on_curve {
+            if has_off {
+                out.quad_to(off_x, off_y, px, py)
+                has_off = false
+            } else {
+                out.line_to(px, py)
+            }
+        } else {
+            if has_off {
+                mx := 0.5 * (off_x + px)
+                my := 0.5 * (off_y + py)
+                out.quad_to(off_x, off_y, mx, my)
+            }
+            off_x = px
+            off_y = py
+            has_off = true
+        }
+        cursor = (cursor + 1) % n
+    }
+    if has_off {
+        out.quad_to(off_x, off_y, sx, sy)
+    }
+}
+
+fn decode_composite(r: &mut bin.Reader, dir: &sfnt.TableDirectory, loca: &LocaTable, depth: i32) -> outline.Outline {
+    mut out := outline.Outline::new()
+    empty_deltas: []f64 = []
+    mut more := true
+    while more {
+        comp_flags := r.read_u16(&dir.data)
+        comp_gid := r.read_u16(&dir.data)
+        if !r.ok { return outline.Outline::fail("truncated composite glyph record") }
+
+        mut arg1 := 0
+        mut arg2 := 0
+        if comp_flags.bit_and(1) != 0 {
+            if comp_flags.bit_and(2) != 0 {
+                arg1 = r.read_i16(&dir.data)
+                arg2 = r.read_i16(&dir.data)
+            } else {
+                arg1 = r.read_u16(&dir.data)
+                arg2 = r.read_u16(&dir.data)
+            }
+        } else {
+            if comp_flags.bit_and(2) != 0 {
+                arg1 = r.read_i8(&dir.data)
+                arg2 = r.read_i8(&dir.data)
+            } else {
+                arg1 = r.read_u8(&dir.data)
+                arg2 = r.read_u8(&dir.data)
+            }
+        }
+        if !r.ok { return outline.Outline::fail("truncated composite glyph arguments") }
+
+        mut m00 := 1.0
+        mut m01 := 0.0
+        mut m10 := 0.0
+        mut m11 := 1.0
+        if comp_flags.bit_and(8) != 0 {
+            s := r.read_f2dot14(&dir.data)
+            m00 = s; m11 = s
+        } else if comp_flags.bit_and(64) != 0 {
+            m00 = r.read_f2dot14(&dir.data)
+            m11 = r.read_f2dot14(&dir.data)
+        } else if comp_flags.bit_and(128) != 0 {
+            m00 = r.read_f2dot14(&dir.data)
+            m10 = r.read_f2dot14(&dir.data)
+            m01 = r.read_f2dot14(&dir.data)
+            m11 = r.read_f2dot14(&dir.data)
+        }
+        if !r.ok { return outline.Outline::fail("truncated composite glyph transform") }
+
+        mut tx := 0.0
+        mut ty := 0.0
+        if comp_flags.bit_and(2) != 0 {
+            tx = f64(arg1)
+            ty = f64(arg2)
+        }
+
+        sub := decode_glyph_with_deltas(&dir, &loca, comp_gid, &empty_deltas, &empty_deltas, depth + 1)
+        if !sub.ok { return sub }
+        out.append_transformed(&sub, m00, m01, m10, m11, tx, ty)
+        more = comp_flags.bit_and(32) != 0
+    }
+    out
+}
+
+// Helper used by gvar to read point count (and raw coordinates) of a simple glyph.
+pub fn simple_glyph_point_count(dir: &sfnt.TableDirectory, loca: &LocaTable, gid: i32) -> i32 {
+    if gid < 0 || gid + 1 >= loca.offsets.len { return 0 }
+    glyf_off := dir.table_offset("glyf")
+    if glyf_off < 0 { return 0 }
+    start := loca.offsets[gid]
+    end := loca.offsets[gid + 1]
+    if end - start < 10 { return 0 }
+    nc := bin.peek_i16(&dir.data, glyf_off + start)
+    if nc <= 0 { return 0 }
+    if end - start < 10 + nc * 2 { return 0 }
+    bin.peek_u16(&dir.data, glyf_off + start + 10 + (nc - 1) * 2) + 1
+}

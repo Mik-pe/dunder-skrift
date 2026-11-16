@@ -1,0 +1,418 @@
+// High-level FreeType-inspired font face, metrics, variation, kerning,
+// color-layer, glyph-outline, and rasterization API in pure Dunder.
+import binary as bin
+import cff
+import cmap
+import color
+import glyf
+import gpos
+import outline
+import raster
+import sfnt
+import std.bytes as bytes
+import sys
+import tables
+import var as variation
+
+pub struct FaceMetrics {
+    units_per_em: i32,
+    ascender: i32,
+    descender: i32,
+    line_gap: i32,
+    typo_ascender: i32,
+    typo_descender: i32,
+    typo_line_gap: i32,
+    x_height: i32,
+    cap_height: i32,
+    x_min: i32,
+    y_min: i32,
+    x_max: i32,
+    y_max: i32,
+    underline_position: i32,
+    underline_thickness: i32,
+    italic_angle: f64,
+    is_fixed_pitch: bool,
+    num_glyphs: i32,
+    face_count: i32,
+    face_index: i32,
+    is_cff: bool,
+    is_cff2: bool,
+    is_variable: bool,
+    has_color: bool,
+    has_kerning: bool,
+    family: string,
+    subfamily: string,
+    full_name: string,
+    postscript_name: string,
+    version: string,
+}
+
+pub struct GlyphMetrics {
+    glyph_id: i32,
+    advance_width: f64,
+    left_side_bearing: f64,
+    x_min: f64,
+    y_min: f64,
+    x_max: f64,
+    y_max: f64,
+}
+
+pub struct RenderedText {
+    ok: bool,
+    error: string,
+    width: i32,
+    height: i32,
+    baseline: i32,
+    advance_x: f64,
+    pixels: []u8,
+}
+
+pub struct Face {
+    ok: bool,
+    error: string,
+    dir: sfnt.TableDirectory,
+    head: tables.HeadTable,
+    maxp: tables.MaxpTable,
+    hhea: tables.HheaTable,
+    hmtx: tables.HmtxTable,
+    os2: tables.Os2Table,
+    post: tables.PostTable,
+    names: tables.NameTable,
+    cmap_table: cmap.CmapTable,
+    loca: glyf.LocaTable,
+    cff_table: cff.CffTable,
+    kern_table: gpos.KernTable,
+    fvar_table: variation.FvarTable,
+    avar_table: variation.AvarTable,
+    hvar_table: variation.HvarTable,
+    gvar_table: variation.GvarTable,
+    color_table: color.ColorTable,
+    norm_coords: []f64,
+    user_coords: []f64,
+    pixel_size: f64,
+}
+
+impl Face {
+    fn fail(move msg: string) -> Self {
+        empty_bytes: []u8 = []
+        Self {
+            ok: false, error: msg,
+            dir: sfnt.TableDirectory::parse(&empty_bytes, 0),
+            head: tables.HeadTable { ok: false, error: "", units_per_em: 0, flags: 0, x_min: 0, y_min: 0, x_max: 0, y_max: 0, mac_style: 0, lowest_rec_ppem: 0, index_to_loc_format: 0 },
+            maxp: tables.MaxpTable { ok: false, error: "", num_glyphs: 0 },
+            hhea: tables.HheaTable { ok: false, error: "", ascender: 0, descender: 0, line_gap: 0, advance_width_max: 0, min_lsb: 0, min_rsb: 0, x_max_extent: 0, number_of_hmetrics: 0 },
+            hmtx: tables.HmtxTable { ok: false, error: "", advances: [], lsbs: [] },
+            os2: tables.Os2Table { present: false, version: 0, avg_char_width: 0, weight_class: 400, width_class: 5, fs_selection: 0, typo_ascender: 0, typo_descender: 0, typo_line_gap: 0, win_ascent: 0, win_descent: 0, x_height: 0, cap_height: 0 },
+            post: tables.PostTable { present: false, italic_angle: 0.0, underline_position: 0, underline_thickness: 0, is_fixed_pitch: false },
+            names: tables.NameTable { ok: false, platform_ids: [], encoding_ids: [], language_ids: [], name_ids: [], values: [] },
+            cmap_table: cmap.CmapTable { ok: false, error: "", format: .None, platform_id: -1, encoding_id: -1, f0_glyphs: [], f4_seg_count: 0, f4_end_codes: [], f4_start_codes: [], f4_id_deltas: [], f4_id_range_offsets: [], f4_id_range_pos: [], f4_table_end: 0, f6_first_code: 0, f6_glyphs: [], f12_start_char: [], f12_end_char: [], f12_start_gid: [], uvs_selectors: [], uvs_codepoints: [], uvs_gids: [] },
+            loca: glyf.LocaTable { ok: false, error: "", offsets: [] },
+            cff_table: cff.CffTable::empty(),
+            kern_table: gpos.KernTable { legacy_keys: [], legacy_vals: [], gpos_subtables: [], gpos_end: 0 },
+            fvar_table: variation.FvarTable::empty(),
+            avar_table: variation.AvarTable::empty(),
+            hvar_table: variation.HvarTable::empty(),
+            gvar_table: variation.GvarTable::empty(),
+            color_table: color.ColorTable::empty(),
+            norm_coords: [], user_coords: [], pixel_size: 16.0,
+        }
+    }
+
+    pub fn from_bytes(font_bytes: &[]u8, face_index: i32) -> Self {
+        dir := sfnt.TableDirectory::parse(&font_bytes, face_index)
+        if !dir.ok { return Self::fail(dir.error.clone()) }
+
+        head := tables.HeadTable::parse(&dir)
+        if !head.ok { return Self::fail(head.error.clone()) }
+
+        maxp := tables.MaxpTable::parse(&dir)
+        if !maxp.ok { return Self::fail(maxp.error.clone()) }
+
+        hhea := tables.HheaTable::parse(&dir)
+        if !hhea.ok { return Self::fail(hhea.error.clone()) }
+
+        hmtx := tables.HmtxTable::parse(&dir, maxp.num_glyphs, hhea.number_of_hmetrics)
+        if !hmtx.ok { return Self::fail(hmtx.error.clone()) }
+
+        os2 := tables.Os2Table::parse(&dir)
+        post := tables.PostTable::parse(&dir)
+        names := tables.NameTable::parse(&dir)
+        cmap_table := cmap.CmapTable::parse(&dir)
+
+        cff_table := cff.CffTable::parse(&dir)
+        if cff_table.present && !cff_table.ok {
+            return Self::fail(cff_table.error.clone())
+        }
+
+        mut loca := glyf.LocaTable { ok: false, error: "", offsets: [] }
+        if !cff_table.present && dir.has_table("glyf") && dir.has_table("loca") {
+            loca = glyf.LocaTable::parse(&dir, maxp.num_glyphs, head.index_to_loc_format)
+            if !loca.ok { return Self::fail(loca.error.clone()) }
+        }
+
+        kern_table := gpos.KernTable::parse(&dir)
+        fvar_table := variation.FvarTable::parse(&dir)
+        avar_table := if fvar_table.present {
+            variation.AvarTable::parse(&dir, fvar_table.axis_count)
+        } else {
+            variation.AvarTable::empty()
+        }
+        hvar_table := variation.HvarTable::parse(&dir)
+        gvar_table := variation.GvarTable::parse(&dir)
+        color_table := color.ColorTable::parse(&dir)
+
+        user_coords := fvar_table.default_coords()
+        norm_coords := variation.normalize_coords(&fvar_table, &avar_table, &user_coords)
+
+        Self {
+            ok: true, error: "", dir: dir, head: head, maxp: maxp, hhea: hhea, hmtx: hmtx,
+            os2: os2, post: post, names: names, cmap_table: cmap_table, loca: loca,
+            cff_table: cff_table, kern_table: kern_table, fvar_table: fvar_table,
+            avar_table: avar_table, hvar_table: hvar_table, gvar_table: gvar_table,
+            color_table: color_table, norm_coords: norm_coords, user_coords: user_coords,
+            pixel_size: 16.0,
+        }
+    }
+
+    pub fn from_file(path: string, face_index: i32) -> Self {
+        res := sys.read_u8(path)
+        if !res.ok {
+            return Self::fail("cannot read font '" + path + "': " + sys.error_message(res.error))
+        }
+        Self::from_bytes(&res.value, face_index)
+    }
+
+    pub fn set_pixel_size(&mut self, px: f64) {
+        if px > 0.0 { self.pixel_size = px }
+    }
+
+    pub fn set_axis(&mut self, tag: string, value: f64) -> bool {
+        if !self.fvar_table.present { return false }
+        idx := self.fvar_table.find_axis(tag)
+        if idx < 0 { return false }
+        self.user_coords[idx] = value
+        self.norm_coords = variation.normalize_coords(&self.fvar_table, &self.avar_table, &self.user_coords)
+        true
+    }
+
+    pub fn reset_axes(&mut self) {
+        self.user_coords = self.fvar_table.default_coords()
+        self.norm_coords = variation.normalize_coords(&self.fvar_table, &self.avar_table, &self.user_coords)
+    }
+
+    pub fn metrics(&self) -> FaceMetrics {
+        FaceMetrics {
+            units_per_em: self.head.units_per_em,
+            ascender: self.hhea.ascender,
+            descender: self.hhea.descender,
+            line_gap: self.hhea.line_gap,
+            typo_ascender: if self.os2.present { self.os2.typo_ascender } else { self.hhea.ascender },
+            typo_descender: if self.os2.present { self.os2.typo_descender } else { self.hhea.descender },
+            typo_line_gap: if self.os2.present { self.os2.typo_line_gap } else { self.hhea.line_gap },
+            x_height: self.os2.x_height,
+            cap_height: self.os2.cap_height,
+            x_min: self.head.x_min, y_min: self.head.y_min,
+            x_max: self.head.x_max, y_max: self.head.y_max,
+            underline_position: self.post.underline_position,
+            underline_thickness: self.post.underline_thickness,
+            italic_angle: self.post.italic_angle,
+            is_fixed_pitch: self.post.is_fixed_pitch,
+            num_glyphs: self.maxp.num_glyphs,
+            face_count: self.dir.face_count,
+            face_index: self.dir.face_index,
+            is_cff: self.cff_table.present && !self.cff_table.is_cff2,
+            is_cff2: self.cff_table.present && self.cff_table.is_cff2,
+            is_variable: self.fvar_table.present,
+            has_color: self.color_table.present,
+            has_kerning: self.kern_table.has_kerning(),
+            family: self.names.family(),
+            subfamily: self.names.subfamily(),
+            full_name: self.names.full_name(),
+            postscript_name: self.names.postscript_name(),
+            version: self.names.version(),
+        }
+    }
+
+    pub fn glyph_index(&self, codepoint: i32) -> i32 {
+        self.cmap_table.lookup(&self.dir.data, codepoint)
+    }
+
+    pub fn glyph_index_rune(&self, ch: rune) -> i32 {
+        self.cmap_table.lookup_rune(&self.dir.data, ch)
+    }
+
+    pub fn glyph_index_variation(&self, codepoint: i32, selector: i32) -> i32 {
+        self.cmap_table.lookup_variation(&self.dir.data, codepoint, selector)
+    }
+
+    pub fn scale_for_px(&self, px: f64) -> f64 {
+        if self.head.units_per_em <= 0 { return 1.0 }
+        px / f64(self.head.units_per_em)
+    }
+
+    pub fn glyph_advance_units(&self, gid: i32) -> f64 {
+        mut adv := f64(self.hmtx.advance(gid))
+        if self.hvar_table.present && self.norm_coords.len > 0 {
+            adv += self.hvar_table.advance_delta(&self.dir.data, gid, &self.norm_coords)
+        } else if self.gvar_table.present && self.norm_coords.len > 0 && self.loca.ok {
+            npts := glyf.simple_glyph_point_count(&self.dir, &self.loca, gid)
+            mut dx: []f64 = []
+            mut dy: []f64 = []
+            self.gvar_table.glyph_deltas(&self.dir.data, gid, npts, &self.norm_coords, &mut dx, &mut dy)
+            // Phantom point npts + 1 is right-side bearing advance point
+            if npts + 1 < dx.len { adv += dx[npts + 1] }
+        }
+        adv
+    }
+
+    pub fn kern_units(&self, left_gid: i32, right_gid: i32) -> i32 {
+        self.kern_table.kern_x(&self.dir.data, left_gid, right_gid)
+    }
+
+    pub fn glyph_outline_units(&self, gid: i32) -> outline.Outline {
+        if !self.ok { return outline.Outline::fail(self.error.clone()) }
+        if self.cff_table.present {
+            return self.cff_table.decode_glyph(&self.dir.data, gid, &self.norm_coords)
+        }
+        if !self.loca.ok {
+            return outline.Outline::fail("font contains neither glyf nor CFF outlines")
+        }
+        if self.gvar_table.present && self.norm_coords.len > 0 {
+            npts := glyf.simple_glyph_point_count(&self.dir, &self.loca, gid)
+            if npts > 0 {
+                mut dx: []f64 = []
+                mut dy: []f64 = []
+                self.gvar_table.glyph_deltas(&self.dir.data, gid, npts, &self.norm_coords, &mut dx, &mut dy)
+                return glyf.decode_glyph_with_deltas(&self.dir, &self.loca, gid, &dx, &dy, 0)
+            }
+        }
+        glyf.decode_glyph(&self.dir, &self.loca, gid)
+    }
+
+    pub fn glyph_metrics(&self, gid: i32) -> GlyphMetrics {
+        scale := self.scale_for_px(self.pixel_size)
+        out := self.glyph_outline_units(gid)
+        bbox := out.bounds()
+        GlyphMetrics {
+            glyph_id: gid,
+            advance_width: self.glyph_advance_units(gid) * scale,
+            left_side_bearing: f64(self.hmtx.lsb(gid)) * scale,
+            x_min: if bbox.valid { bbox.min_x * scale } else { 0.0 },
+            y_min: if bbox.valid { bbox.min_y * scale } else { 0.0 },
+            x_max: if bbox.valid { bbox.max_x * scale } else { 0.0 },
+            y_max: if bbox.valid { bbox.max_y * scale } else { 0.0 },
+        }
+    }
+
+    pub fn render_glyph(&self, gid: i32) -> raster.Bitmap {
+        scale := self.scale_for_px(self.pixel_size)
+        out := self.glyph_outline_units(gid)
+        raster.rasterize(&out, scale, scale, true)
+    }
+
+    pub fn render_rune(&self, ch: rune) -> raster.Bitmap {
+        self.render_glyph(self.glyph_index_rune(ch))
+    }
+
+    pub fn color_layers(&self, gid: i32, palette: i32) -> color.ColorLayers {
+        self.color_table.lookup_v0(gid, palette)
+    }
+
+    pub fn render_text(&self, text: string) -> RenderedText {
+        if !self.ok {
+            return RenderedText { ok: false, error: self.error.clone(), width: 0, height: 0, baseline: 0, advance_x: 0.0, pixels: [] }
+        }
+        scale := self.scale_for_px(self.pixel_size)
+        asc_px := i32((f64(self.hhea.ascender) * scale).ceil())
+        desc_px := i32((f64(-self.hhea.descender) * scale).ceil())
+        mut line_h := asc_px + desc_px
+        if line_h < 1 { line_h = i32(self.pixel_size.ceil()) }
+
+        // First pass: lay out glyphs & measure bounding box
+        mut pen_x := 0.0
+        mut prev_gid := -1
+        mut gids: []i32 = []
+        mut gx: []f64 = []
+        mut min_px := 0
+        mut max_px := 0
+        mut min_py := 0
+        mut max_py := line_h
+
+        for ch in text.runes() {
+            gid := self.glyph_index_rune(ch)
+            if prev_gid >= 0 {
+                pen_x += f64(self.kern_units(prev_gid, gid)) * scale
+            }
+            gids.push(gid)
+            gx.push(pen_x)
+            pen_x += self.glyph_advance_units(gid) * scale
+            prev_gid = gid
+        }
+        total_w := i32(pen_x.ceil()) + 2
+        if total_w > max_px { max_px = total_w }
+
+        // Render each glyph and composite into canvas
+        mut bitmaps_w: []i32 = []
+        mut bitmaps_h: []i32 = []
+        mut bitmaps_l: []i32 = []
+        mut bitmaps_t: []i32 = []
+        mut bitmaps_px_starts: []i32 = []
+        mut all_px: []u8 = []
+
+        for i in 0..gids.len {
+            bm := self.render_glyph(gids[i])
+            px_x := i32(gx[i].round()) + bm.left
+            px_y := asc_px - bm.top
+            if bm.width > 0 && bm.height > 0 {
+                if px_x < min_px { min_px = px_x }
+                if px_x + bm.width > max_px { max_px = px_x + bm.width }
+                if px_y < min_py { min_py = px_y }
+                if px_y + bm.height > max_py { max_py = px_y + bm.height }
+            }
+            bitmaps_w.push(bm.width)
+            bitmaps_h.push(bm.height)
+            bitmaps_l.push(px_x)
+            bitmaps_t.push(px_y)
+            bitmaps_px_starts.push(all_px.len)
+            for p in &bm.pixels { all_px.push(p) }
+        }
+
+        w := max_px - min_px
+        h := max_py - min_py
+        if w <= 0 || h <= 0 || w > 8192 || h > 4096 {
+            return RenderedText { ok: true, error: "", width: 0, height: 0, baseline: asc_px, advance_x: pen_x, pixels: [] }
+        }
+        mut canvas: []u8 = []
+        canvas.reserve(w * h)
+        for _ in 0..(w * h) { canvas.push(0) }
+
+        for i in 0..gids.len {
+            bw := bitmaps_w[i]
+            bh := bitmaps_h[i]
+            bl := bitmaps_l[i] - min_px
+            bt := bitmaps_t[i] - min_py
+            start := bitmaps_px_starts[i]
+            for row in 0..bh {
+                for col in 0..bw {
+                    src_a := i32(all_px[start + row * bw + col])
+                    if src_a == 0 { continue }
+                    dx := bl + col
+                    dy := bt + row
+                    if dx >= 0 && dx < w && dy >= 0 && dy < h {
+                        idx := dy * w + dx
+                        dst_a := i32(canvas[idx])
+                        // Screen blend: a + b - (a*b)/255
+                        blended := dst_a + src_a - (dst_a * src_a) / 255
+                        canvas[idx] = if blended >= 255 { 255 } else { u8(blended) }
+                    }
+                }
+            }
+        }
+
+        RenderedText {
+            ok: true, error: "",
+            width: w, height: h, baseline: asc_px - min_py,
+            advance_x: pen_x, pixels: canvas,
+        }
+    }
+}

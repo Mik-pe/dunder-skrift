@@ -1,0 +1,211 @@
+// FreeType-style analytic anti-aliased scanline coverage rasterizer:
+// takes an Outline + pixel scale, flattens curves, computes exact pixel area/winding
+// coverage into an 8-bit alpha Bitmap, and supports ASCII preview & RGBA conversion.
+import outline
+
+pub struct Bitmap {
+    ok: bool,
+    width: i32,
+    height: i32,
+    left: i32,   // horizontal bearing in pixels relative to glyph origin
+    top: i32,    // vertical bearing above baseline (Y-up)
+    pixels: []u8, // width * height grayscale alpha coverage [0..255]
+}
+
+impl Bitmap {
+    pub fn empty() -> Self {
+        Self { ok: true, width: 0, height: 0, left: 0, top: 0, pixels: [] }
+    }
+
+    pub fn pixel_at(&self, x: i32, y: i32) -> i32 {
+        if x < 0 || y < 0 || x >= self.width || y >= self.height { return 0 }
+        i32(self.pixels[y * self.width + x])
+    }
+
+    pub fn to_rgba(&self, r: u8, g: u8, b: u8) -> []u8 {
+        mut out: []u8 = []
+        out.reserve(self.pixels.len * 4)
+        for cov in &self.pixels {
+            out.push(r)
+            out.push(g)
+            out.push(b)
+            out.push(cov)
+        }
+        out
+    }
+
+    pub fn ascii_art(&self) -> string {
+        if self.width <= 0 || self.height <= 0 { return "(empty bitmap)" }
+        ramp := " .:-=+*#%@"
+        mut lines := ""
+        for y in 0..self.height {
+            mut row := ""
+            for x in 0..self.width {
+                v := self.pixel_at(x, y)
+                idx := (v * 9) / 255
+                row = row + ramp[idx..idx + 1]
+            }
+            if y > 0 { lines = lines + "\n" }
+            lines = lines + row
+        }
+        lines
+    }
+}
+
+pub fn rasterize(src: &outline.Outline, scale_x: f64, scale_y: f64, non_zero_winding: bool) -> Bitmap {
+    if !src.ok || src.segment_count() == 0 {
+        return Bitmap::empty()
+    }
+    mut scaled := outline.Outline::new()
+    // Flip Y to screen coordinates (+Y down) while scaling from font units -> pixels.
+    scaled.append_transformed(&src, scale_x, 0.0, 0.0, -scale_y, 0.0, 0.0)
+    bbox := scaled.bounds()
+    if !bbox.valid { return Bitmap::empty() }
+
+    x0 := i32(bbox.min_x.floor()) - 1
+    y0 := i32(bbox.min_y.floor()) - 1
+    x1 := i32(bbox.max_x.ceil()) + 1
+    y1 := i32(bbox.max_y.ceil()) + 1
+    w := x1 - x0
+    h := y1 - y0
+    if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+        return Bitmap::empty()
+    }
+
+    // Shift into bitmap local pixel box [0..w, 0..h]
+    scaled.translate(-f64(x0), -f64(y0))
+    poly := scaled.flatten(0.125)
+
+    // Analytic pixel coverage accumulation buffer (cover + area per pixel).
+    total := w * h
+    mut cover: []f64 = []
+    mut area: []f64 = []
+    cover.reserve(total)
+    area.reserve(total)
+    for _ in 0..total {
+        cover.push(0.0)
+        area.push(0.0)
+    }
+
+    for c in 0..poly.contour_starts.len {
+        cs := poly.contour_starts[c]
+        ce := poly.contour_ends[c]
+        if ce - cs < 2 { continue }
+        for i in cs..(ce - 1) {
+            raster_segment(&mut cover, &mut area, w, h, poly.xs[i], poly.ys[i], poly.xs[i + 1], poly.ys[i + 1])
+        }
+    }
+
+    mut pixels: []u8 = []
+    pixels.reserve(total)
+    for y in 0..h {
+        mut winding := 0.0
+        row_base := y * w
+        for x in 0..w {
+            idx := row_base + x
+            val := winding + area[idx]
+            winding += cover[idx]
+            mut cov := val.abs()
+            if !non_zero_winding {
+                mut odd := cov
+                odd = odd - f64(i32((odd * 0.5).floor())) * 2.0
+                if odd > 1.0 { cov = 2.0 - odd } else { cov = odd }
+            }
+            if cov > 1.0 { cov = 1.0 }
+            if cov < 0.0 { cov = 0.0 }
+            alpha := i32((cov * 255.0 + 0.5).floor())
+            if alpha <= 0 { pixels.push(0) }
+            else if alpha >= 255 { pixels.push(255) }
+            else { pixels.push(u8(alpha)) }
+        }
+    }
+
+    // Bitmap `top` in Y-up pixels above baseline: since y_screen = -y_font, top = -y0
+    Bitmap { ok: true, width: w, height: h, left: x0, top: -y0, pixels: pixels }
+}
+
+fn raster_segment(cover: &mut []f64, area: &mut []f64, w: i32, h: i32,
+    ax: f64, ay: f64, bx: f64, by: f64) {
+    if (ay - by).abs() < 1e-9 { return }
+    mut x0 := ax; mut y0 := ay
+    mut x1 := bx; mut y1 := by
+    mut dir := 1.0
+    if y0 > y1 {
+        x0 = bx; y0 = by
+        x1 = ax; y1 = ay
+        dir = -1.0
+    }
+    if y1 <= 0.0 || y0 >= f64(h) { return }
+
+    dx_dy := (x1 - x0) / (y1 - y0)
+    mut y_start := i32(y0.floor())
+    mut y_end := i32((y1 - 1e-9).floor())
+    if y_start < 0 { y_start = 0 }
+    if y_end >= h { y_end = h - 1 }
+
+    for py in y_start..(y_end + 1) {
+        sy0 := if y0 > f64(py) { y0 } else { f64(py) }
+        sy1 := if y1 < f64(py + 1) { y1 } else { f64(py + 1) }
+        dy := sy1 - sy0
+        if dy <= 1e-9 { continue }
+        sx0 := x0 + (sy0 - y0) * dx_dy
+        sx1 := x0 + (sy1 - y0) * dx_dy
+        // Step across horizontal pixel columns intersected by this sub-segment.
+        raster_scan_span(&mut cover, &mut area, w, py, sx0, sx1, dy * dir)
+    }
+}
+
+fn raster_scan_span(cover: &mut []f64, area: &mut []f64, w: i32, py: i32,
+    sx0: f64, sx1: f64, signed_dy: f64) {
+    row := py * w
+    mut px0 := i32(sx0.floor())
+    mut px1 := i32(sx1.floor())
+    if px0 == px1 {
+        x_mid := 0.5 * (sx0 + sx1)
+        if px0 < 0 {
+            cover[row] += signed_dy
+            area[row] += signed_dy
+        } else if px0 < w {
+            frac := f64(px0 + 1) - x_mid
+            cover[row + px0] += signed_dy
+            area[row + px0] += signed_dy * frac
+        }
+        return
+    }
+
+    // Sub-segment crosses one or more vertical pixel boundaries: split linearly along X.
+    mut x_cur := sx0
+    mut y_frac_acc := 0.0
+    total_dx := sx1 - sx0
+    step := if sx1 > sx0 { 1 } else { -1 }
+    mut px := px0
+    while true {
+        x_next := if px == px1 {
+            sx1
+        } else if step > 0 {
+            f64(px + 1)
+        } else {
+            f64(px)
+        }
+        seg_dy := if total_dx.abs() < 1e-12 {
+            signed_dy - y_frac_acc
+        } else if px == px1 {
+            signed_dy - y_frac_acc
+        } else {
+            signed_dy * ((x_next - x_cur) / total_dx)
+        }
+        y_frac_acc += seg_dy
+        x_mid := 0.5 * (x_cur + x_next)
+        if px < 0 {
+            cover[row] += seg_dy
+            area[row] += seg_dy
+        } else if px < w {
+            frac := f64(px + 1) - x_mid
+            cover[row + px] += seg_dy
+            area[row + px] += seg_dy * frac
+        }
+        if px == px1 { break }
+        x_cur = x_next
+        px += step
+    }
+}

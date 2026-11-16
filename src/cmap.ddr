@@ -1,0 +1,348 @@
+// OpenType/TrueType `cmap` character-to-glyph mapping:
+// supports Formats 0, 4, 6, 12 (full Unicode), and 14 (Variation Sequences).
+import binary as bin
+import sfnt
+
+pub enum CmapFormat { None = 0, Format0 = 1, Format4 = 2, Format6 = 3, Format12 = 4 }
+
+pub struct CmapTable {
+    ok: bool,
+    error: string,
+    format: CmapFormat,
+    platform_id: i32,
+    encoding_id: i32,
+    // Format 0
+    f0_glyphs: []i32,
+    // Format 4
+    f4_seg_count: i32,
+    f4_end_codes: []i32,
+    f4_start_codes: []i32,
+    f4_id_deltas: []i32,
+    f4_id_range_offsets: []i32,
+    f4_id_range_pos: []i32,
+    f4_table_end: i32,
+    // Format 6
+    f6_first_code: i32,
+    f6_glyphs: []i32,
+    // Format 12
+    f12_start_char: []u32,
+    f12_end_char: []u32,
+    f12_start_gid: []i32,
+    // Format 14 Unicode Variation Sequences (non-default UVS)
+    uvs_selectors: []i32,
+    uvs_codepoints: []i32,
+    uvs_gids: []i32,
+}
+
+impl CmapTable {
+    fn empty(move err: string) -> Self {
+        Self {
+            ok: false, error: err, format: .None, platform_id: -1, encoding_id: -1,
+            f0_glyphs: [], f4_seg_count: 0, f4_end_codes: [], f4_start_codes: [],
+            f4_id_deltas: [], f4_id_range_offsets: [], f4_id_range_pos: [], f4_table_end: 0,
+            f6_first_code: 0, f6_glyphs: [],
+            f12_start_char: [], f12_end_char: [], f12_start_gid: [],
+            uvs_selectors: [], uvs_codepoints: [], uvs_gids: [],
+        }
+    }
+
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        cmap_off := dir.table_offset("cmap")
+        cmap_len := dir.table_length("cmap")
+        if cmap_off < 0 || cmap_len < 4 {
+            return Self::empty("missing cmap table")
+        }
+        mut r := bin.Reader::slice(&dir.data, cmap_off, cmap_len)
+        _ := r.read_u16(&dir.data) // version
+        num_tables := r.read_u16(&dir.data)
+        if !r.ok || num_tables <= 0 {
+            return Self::empty("invalid cmap header")
+        }
+
+        mut best_rank := -1
+        mut best_off := -1
+        mut best_pid := -1
+        mut best_eid := -1
+        mut uvs_off := -1
+
+        for _ in 0..num_tables {
+            pid := r.read_u16(&dir.data)
+            eid := r.read_u16(&dir.data)
+            sub_off := r.read_u32(&dir.data)
+            if !r.ok { break }
+            if i64(sub_off) > i64(cmap_len) - 4 { continue }
+            abs_sub := cmap_off + i32(sub_off)
+            fmt := bin.peek_u16(&dir.data, abs_sub)
+            if pid == 0 && eid == 5 && fmt == 14 {
+                uvs_off = abs_sub
+                continue
+            }
+            rank := subtable_rank(pid, eid, fmt)
+            if rank > best_rank {
+                best_rank = rank
+                best_off = abs_sub
+                best_pid = pid
+                best_eid = eid
+            }
+        }
+
+        if best_off < 0 {
+            return Self::empty("no supported cmap subtable found")
+        }
+
+        sub_len := cmap_off + cmap_len - best_off
+        fmt := bin.peek_u16(&dir.data, best_off)
+        mut table := if fmt == 12 {
+            parse_format12(&dir.data, best_off, sub_len, best_pid, best_eid)
+        } else if fmt == 4 {
+            parse_format4(&dir.data, best_off, sub_len, best_pid, best_eid)
+        } else if fmt == 6 {
+            parse_format6(&dir.data, best_off, sub_len, best_pid, best_eid)
+        } else {
+            parse_format0(&dir.data, best_off, sub_len, best_pid, best_eid)
+        }
+        if table.ok && uvs_off >= 0 {
+            parse_format14(&dir.data, uvs_off, cmap_off + cmap_len - uvs_off, &mut table)
+        }
+        table
+    }
+
+    pub fn lookup(&self, data: &[]u8, codepoint: i32) -> i32 {
+        if !self.ok || codepoint < 0 || codepoint > 0x10FFFF { return 0 }
+        match self.format {
+            .Format12 => lookup_f12(&self, u32(codepoint)),
+            .Format4 => lookup_f4(&self, &data, codepoint),
+            .Format6 => lookup_f6(&self, codepoint),
+            .Format0 => {
+                if codepoint < self.f0_glyphs.len { self.f0_glyphs[codepoint] } else { 0 }
+            },
+            .None => 0,
+        }
+    }
+
+    pub fn lookup_rune(&self, data: &[]u8, ch: rune) -> i32 {
+        self.lookup(&data, i32(ch))
+    }
+
+    pub fn lookup_variation(&self, data: &[]u8, codepoint: i32, selector: i32) -> i32 {
+        mut lo := 0
+        mut hi := self.uvs_selectors.len
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            msel := self.uvs_selectors[mid]
+            mcp := self.uvs_codepoints[mid]
+            if msel < selector || (msel == selector && mcp < codepoint) {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo < self.uvs_selectors.len && self.uvs_selectors[lo] == selector && self.uvs_codepoints[lo] == codepoint {
+            return self.uvs_gids[lo]
+        }
+        self.lookup(&data, codepoint)
+    }
+}
+
+fn subtable_rank(pid: i32, eid: i32, fmt: i32) -> i32 {
+    if fmt != 0 && fmt != 4 && fmt != 6 && fmt != 12 { return -1 }
+    if pid == 3 && eid == 10 && fmt == 12 { return 100 }
+    if pid == 0 && eid == 4 && fmt == 12 { return 95 }
+    if pid == 0 && fmt == 12 { return 90 }
+    if pid == 3 && eid == 1 && fmt == 4 { return 80 }
+    if pid == 0 && eid == 3 && fmt == 4 { return 75 }
+    if pid == 0 && fmt == 4 { return 70 }
+    if pid == 3 && eid == 0 && fmt == 4 { return 60 }
+    if pid == 1 && eid == 0 && fmt == 6 { return 30 }
+    if pid == 1 && eid == 0 && fmt == 0 { return 20 }
+    if fmt == 4 { return 15 }
+    if fmt == 6 { return 10 }
+    if fmt == 0 { return 5 }
+    -1
+}
+
+fn parse_format0(data: &[]u8, off: i32, sub_len: i32, pid: i32, eid: i32) -> CmapTable {
+    if sub_len < 262 { return CmapTable::empty("truncated cmap format 0") }
+    mut glyphs: []i32 = []
+    glyphs.reserve(256)
+    for i in 0..256 { glyphs.push(i32(data[off + 6 + i])) }
+    mut t := CmapTable::empty("")
+    t.ok = true; t.format = .Format0; t.platform_id = pid; t.encoding_id = eid
+    t.f0_glyphs = glyphs
+    t
+}
+
+fn parse_format6(data: &[]u8, off: i32, sub_len: i32, pid: i32, eid: i32) -> CmapTable {
+    mut r := bin.Reader::slice(&data, off, sub_len)
+    _ := r.read_u16(&data) // format
+    _ := r.read_u16(&data) // length
+    _ := r.read_u16(&data) // language
+    first := r.read_u16(&data)
+    cnt := r.read_u16(&data)
+    if !r.ok || r.remaining() < cnt * 2 {
+        return CmapTable::empty("truncated cmap format 6")
+    }
+    mut glyphs: []i32 = []
+    glyphs.reserve(cnt)
+    for _ in 0..cnt { glyphs.push(r.read_u16(&data)) }
+    mut t := CmapTable::empty("")
+    t.ok = true; t.format = .Format6; t.platform_id = pid; t.encoding_id = eid
+    t.f6_first_code = first
+    t.f6_glyphs = glyphs
+    t
+}
+
+fn parse_format4(data: &[]u8, off: i32, max_len: i32, pid: i32, eid: i32) -> CmapTable {
+    mut r := bin.Reader::slice(&data, off, max_len)
+    _ := r.read_u16(&data) // format
+    sub_len := r.read_u16(&data)
+    _ := r.read_u16(&data) // language
+    seg_count_x2 := r.read_u16(&data)
+    _ := r.read_u16(&data) // searchRange
+    _ := r.read_u16(&data) // entrySelector
+    _ := r.read_u16(&data) // rangeShift
+    if !r.ok || seg_count_x2 <= 0 || seg_count_x2 % 2 != 0 || sub_len > max_len {
+        return CmapTable::empty("invalid cmap format 4 header")
+    }
+    seg_count := seg_count_x2 / 2
+    mut end_codes: []i32 = []
+    mut start_codes: []i32 = []
+    mut id_deltas: []i32 = []
+    mut id_range_offsets: []i32 = []
+    mut id_range_pos: []i32 = []
+    end_codes.reserve(seg_count)
+    start_codes.reserve(seg_count)
+    id_deltas.reserve(seg_count)
+    id_range_offsets.reserve(seg_count)
+    id_range_pos.reserve(seg_count)
+
+    for _ in 0..seg_count { end_codes.push(r.read_u16(&data)) }
+    _ := r.read_u16(&data) // reservedPad
+    for _ in 0..seg_count { start_codes.push(r.read_u16(&data)) }
+    for _ in 0..seg_count { id_deltas.push(r.read_i16(&data)) }
+    for _ in 0..seg_count {
+        pos := r.pos
+        id_range_pos.push(pos)
+        id_range_offsets.push(r.read_u16(&data))
+    }
+    if !r.ok {
+        return CmapTable::empty("truncated cmap format 4 segments")
+    }
+    mut t := CmapTable::empty("")
+    t.ok = true; t.format = .Format4; t.platform_id = pid; t.encoding_id = eid
+    t.f4_seg_count = seg_count
+    t.f4_end_codes = end_codes
+    t.f4_start_codes = start_codes
+    t.f4_id_deltas = id_deltas
+    t.f4_id_range_offsets = id_range_offsets
+    t.f4_id_range_pos = id_range_pos
+    t.f4_table_end = off + sub_len
+    t
+}
+
+fn parse_format12(data: &[]u8, off: i32, max_len: i32, pid: i32, eid: i32) -> CmapTable {
+    mut r := bin.Reader::slice(&data, off, max_len)
+    _ := r.read_u16(&data) // format
+    _ := r.read_u16(&data) // reserved
+    _ := r.read_u32(&data) // length
+    _ := r.read_u32(&data) // language
+    num_groups := r.read_u32(&data)
+    if !r.ok || num_groups > 1000000 || i64(r.remaining()) < i64(num_groups) * 12 {
+        return CmapTable::empty("invalid cmap format 12 header")
+    }
+    n := i32(num_groups)
+    mut sc: []u32 = []
+    mut ec: []u32 = []
+    mut sg: []i32 = []
+    sc.reserve(n); ec.reserve(n); sg.reserve(n)
+    for _ in 0..n {
+        s := r.read_u32(&data)
+        e := r.read_u32(&data)
+        g := r.read_u32(&data)
+        if !r.ok { return CmapTable::empty("truncated cmap format 12") }
+        sc.push(s); ec.push(e); sg.push(i32(g))
+    }
+    mut t := CmapTable::empty("")
+    t.ok = true; t.format = .Format12; t.platform_id = pid; t.encoding_id = eid
+    t.f12_start_char = sc
+    t.f12_end_char = ec
+    t.f12_start_gid = sg
+    t
+}
+
+fn parse_format14(data: &[]u8, off: i32, max_len: i32, table: &mut CmapTable) {
+    mut r := bin.Reader::slice(&data, off, max_len)
+    _ := r.read_u16(&data) // format 14
+    _ := r.read_u32(&data) // length
+    num_records := r.read_u32(&data)
+    if !r.ok || num_records > 10000 { return }
+    n := i32(num_records)
+    mut selectors: []i32 = []
+    mut non_def_offs: []i32 = []
+    for _ in 0..n {
+        sel := r.read_u24(&data)
+        _ := r.read_u32(&data) // defaultUVSOffset
+        nd_off := r.read_u32(&data)
+        if !r.ok { return }
+        selectors.push(sel)
+        if nd_off > 0 && i64(nd_off) < i64(max_len) { non_def_offs.push(i32(nd_off)) }
+        else { non_def_offs.push(-1) }
+    }
+    for i in 0..n {
+        nd := non_def_offs[i]
+        if nd < 0 { continue }
+        mut sr := bin.Reader::slice(&data, off + nd, max_len - nd)
+        cnt := sr.read_u32(&data)
+        if !sr.ok || cnt > 100000 { continue }
+        for _ in 0..i32(cnt) {
+            cp := sr.read_u24(&data)
+            gid := sr.read_u16(&data)
+            if !sr.ok { break }
+            table.uvs_selectors.push(selectors[i])
+            table.uvs_codepoints.push(cp)
+            table.uvs_gids.push(gid)
+        }
+    }
+}
+
+fn lookup_f4(t: &CmapTable, data: &[]u8, cp: i32) -> i32 {
+    if cp < 0 || cp > 65535 || t.f4_seg_count == 0 { return 0 }
+    mut lo := 0
+    mut hi := t.f4_seg_count - 1
+    while lo < hi {
+        mid := lo + (hi - lo) / 2
+        if t.f4_end_codes[mid] < cp { lo = mid + 1 }
+        else { hi = mid }
+    }
+    if cp > t.f4_end_codes[lo] || cp < t.f4_start_codes[lo] { return 0 }
+    if t.f4_start_codes[lo] == 65535 { return 0 }
+    range_off := t.f4_id_range_offsets[lo]
+    if range_off == 0 {
+        return (cp + t.f4_id_deltas[lo]).bit_and(65535)
+    }
+    glyph_pos := t.f4_id_range_pos[lo] + range_off + (cp - t.f4_start_codes[lo]) * 2
+    if glyph_pos < 0 || glyph_pos + 2 > t.f4_table_end || glyph_pos + 2 > data.len { return 0 }
+    gid := bin.peek_u16(&data, glyph_pos)
+    if gid == 0 { return 0 }
+    (gid + t.f4_id_deltas[lo]).bit_and(65535)
+}
+
+fn lookup_f6(t: &CmapTable, cp: i32) -> i32 {
+    idx := cp - t.f6_first_code
+    if idx < 0 || idx >= t.f6_glyphs.len { return 0 }
+    t.f6_glyphs[idx]
+}
+
+fn lookup_f12(t: &CmapTable, cp: u32) -> i32 {
+    mut lo := 0
+    mut hi := t.f12_start_char.len
+    while lo < hi {
+        mid := lo + (hi - lo) / 2
+        if t.f12_end_char[mid] < cp { lo = mid + 1 }
+        else { hi = mid }
+    }
+    if lo < t.f12_start_char.len && cp >= t.f12_start_char[lo] && cp <= t.f12_end_char[lo] {
+        return t.f12_start_gid[lo] + i32(cp - t.f12_start_char[lo])
+    }
+    0
+}

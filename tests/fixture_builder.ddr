@@ -1,0 +1,1508 @@
+// Synthetic binary font fixture builder for pure-Dunder tests.
+// Constructs valid in-memory SFNT/TTF, CFF, CFF2, TTC, WOFF1, variable font,
+// kerning/GPOS, cmap (0/4/6/12/14), CPAL/COLR v0, and DEFLATE zlib vectors.
+import "../src/binary" as bin
+
+pub struct Buf {
+    data: []u8,
+}
+
+impl Buf {
+    pub fn new() -> Self {
+        Self { data: [] }
+    }
+
+    pub fn push_u8(&mut self, v: i32) {
+        self.data.push(u8(v.bit_and(255)))
+    }
+
+    pub fn push_i8(&mut self, v: i32) {
+        self.push_u8(if v < 0 { 256 + v } else { v })
+    }
+
+    pub fn push_u16(&mut self, v: i32) {
+        self.data.push(u8(v.shr(8).bit_and(255)))
+        self.data.push(u8(v.bit_and(255)))
+    }
+
+    pub fn push_i16(&mut self, v: i32) {
+        u := if v < 0 { 65536 + v } else { v }
+        self.push_u16(u)
+    }
+
+    pub fn push_u24(&mut self, v: i32) {
+        self.data.push(u8(v.shr(16).bit_and(255)))
+        self.data.push(u8(v.shr(8).bit_and(255)))
+        self.data.push(u8(v.bit_and(255)))
+    }
+
+    pub fn push_u32(&mut self, v: u32) {
+        self.data.push(u8(v.shr(24).bit_and(255)))
+        self.data.push(u8(v.shr(16).bit_and(255)))
+        self.data.push(u8(v.shr(8).bit_and(255)))
+        self.data.push(u8(v.bit_and(255)))
+    }
+
+    pub fn push_i32(&mut self, v: i32) {
+        u := if v < 0 { u32(i64(4294967296) + i64(v)) } else { u32(v) }
+        self.push_u32(u)
+    }
+
+    pub fn push_fixed(&mut self, val: f64) {
+        raw := i64((val * 65536.0).round())
+        u := if raw < 0 { u32(i64(4294967296) + raw) } else { u32(raw) }
+        self.push_u32(u)
+    }
+
+    pub fn push_f2dot14(&mut self, val: f64) {
+        raw := i32((val * 16384.0).round())
+        self.push_i16(raw)
+    }
+
+    pub fn push_tag(&mut self, tag: string) {
+        self.push_u32(bin.tag_from_str(tag))
+    }
+
+    pub fn push_str_bytes(&mut self, s: string) {
+        for i in 0..s.len {
+            self.data.push(u8(s[i]))
+        }
+    }
+
+    pub fn push_utf16be(&mut self, ascii: string) {
+        for i in 0..ascii.len {
+            self.data.push(0)
+            self.data.push(u8(ascii[i]))
+        }
+    }
+
+    pub fn push_bytes(&mut self, src: &[]u8) {
+        for b in &src {
+            self.data.push(b)
+        }
+    }
+
+    pub fn pad4(&mut self) {
+        while self.data.len % 4 != 0 {
+            self.data.push(0)
+        }
+    }
+
+    pub fn set_u16(&mut self, pos: i32, v: i32) {
+        self.data[pos] = u8(v.shr(8).bit_and(255))
+        self.data[pos + 1] = u8(v.bit_and(255))
+    }
+
+    pub fn set_u32(&mut self, pos: i32, v: u32) {
+        self.data[pos] = u8(v.shr(24).bit_and(255))
+        self.data[pos + 1] = u8(v.shr(16).bit_and(255))
+        self.data[pos + 2] = u8(v.shr(8).bit_and(255))
+        self.data[pos + 3] = u8(v.bit_and(255))
+    }
+}
+
+pub struct TablePack {
+    tags: []string,
+    flat: []u8,
+    starts: []i32,
+    lengths: []i32,
+}
+
+impl TablePack {
+    pub fn new() -> Self {
+        Self { tags: [], flat: [], starts: [], lengths: [] }
+    }
+
+    pub fn add(&mut self, tag: string, bytes: &[]u8) {
+        self.tags.push(tag.clone())
+        self.starts.push(self.flat.len)
+        self.lengths.push(bytes.len)
+        for b in &bytes { self.flat.push(b) }
+    }
+
+    pub fn add_owned(&mut self, tag: string, move bytes: []u8) {
+        self.add(tag, &bytes)
+    }
+
+    fn sorted_indices(&self) -> []i32 {
+        mut order: []i32 = []
+        for i in 0..self.tags.len { order.push(i) }
+        for i in 0..order.len {
+            for j in (i + 1)..order.len {
+                if bin.tag_from_str(self.tags[order[j]]) < bin.tag_from_str(self.tags[order[i]]) {
+                    tmp := order[i]
+                    order[i] = order[j]
+                    order[j] = tmp
+                }
+            }
+        }
+        order
+    }
+
+    pub fn build_sfnt(&self, version: u32) -> []u8 {
+        order := self.sorted_indices()
+        n := order.len
+        mut max_pow2 := 1
+        mut entry_sel := 0
+        while max_pow2 * 2 <= n {
+            max_pow2 *= 2
+            entry_sel += 1
+        }
+        search_range := max_pow2 * 16
+        range_shift := n * 16 - search_range
+
+        mut out := Buf::new()
+        out.push_u32(version)
+        out.push_u16(n)
+        out.push_u16(search_range)
+        out.push_u16(entry_sel)
+        out.push_u16(range_shift)
+        for _ in 0..(n * 16) { out.push_u8(0) }
+
+        mut head_off := -1
+        for slot in 0..n {
+            idx := order[slot]
+            out.pad4()
+            off := out.data.len
+            start := self.starts[idx]
+            sz := self.lengths[idx]
+            for k in 0..sz { out.data.push(self.flat[start + k]) }
+            out.pad4()
+            if self.tags[idx] == "head" { head_off = off }
+
+            mut csum: u32 = bin.sfnt_checksum(&out.data, off, sz)
+            if self.tags[idx] == "head" && sz >= 12 {
+                // Zero out checksumAdjustment at +8 before computing table checksum
+                out.set_u32(off + 8, 0)
+                csum = bin.sfnt_checksum(&out.data, off, sz)
+            }
+            dir_pos := 12 + slot * 16
+            out.set_u32(dir_pos, bin.tag_from_str(self.tags[idx]))
+            out.set_u32(dir_pos + 4, csum)
+            out.set_u32(dir_pos + 8, u32(off))
+            out.set_u32(dir_pos + 12, u32(sz))
+        }
+
+        if head_off >= 0 && head_off + 12 <= out.data.len {
+            whole := bin.sfnt_checksum(&out.data, 0, out.data.len)
+            adj := u32((i64(0xB1B0AFBA) - i64(whole)).bit_and(0xFFFFFFFF))
+            out.set_u32(head_off + 8, adj)
+        }
+        out.data
+    }
+
+    pub fn build_woff1(&self, flavor: u32, mode: i32) -> []u8 {
+        // mode: 0 = uncompressed, 1 = zlib stored for compressible tables, 2 = zlib fixed-huffman for large tables
+        order := self.sorted_indices()
+        n := order.len
+        mut total_sfnt := 12 + n * 16
+        for slot in 0..n {
+            idx := order[slot]
+            sz := self.lengths[idx]
+            total_sfnt += ((sz + 3) / 4) * 4
+        }
+
+        mut out := Buf::new()
+        out.push_tag("wOFF")
+        out.push_u32(flavor)
+        out.push_u32(0) // length placeholder
+        out.push_u16(n)
+        out.push_u16(0) // reserved
+        out.push_u32(u32(total_sfnt))
+        out.push_u16(1) // major
+        out.push_u16(0) // minor
+        for _ in 0..5 { out.push_u32(0) } // meta/priv
+        for _ in 0..(n * 20) { out.push_u8(0) }
+
+        for slot in 0..n {
+            idx := order[slot]
+            out.pad4()
+            off := out.data.len
+            start := self.starts[idx]
+            sz := self.lengths[idx]
+            mut raw: []u8 = []
+            for k in 0..sz { raw.push(self.flat[start + k]) }
+            csum := bin.sfnt_checksum(&raw, 0, sz)
+
+            mut payload := raw.clone()
+            if mode == 2 && sz >= 20 {
+                comp := zlib_compress_fixed_lz77(&raw)
+                if comp.len < raw.len {
+                    payload = comp
+                }
+            }
+            clen := payload.len
+            out.push_bytes(&payload)
+            out.pad4()
+
+            dpos := 44 + slot * 20
+            out.set_u32(dpos, bin.tag_from_str(self.tags[idx]))
+            out.set_u32(dpos + 4, u32(off))
+            out.set_u32(dpos + 8, u32(clen))
+            out.set_u32(dpos + 12, u32(sz))
+            out.set_u32(dpos + 16, csum)
+        }
+        out.pad4()
+        out.set_u32(8, u32(out.data.len))
+        out.data
+    }
+}
+
+// Builds a TrueType Collection (`ttcf`) combining multiple raw SFNT fonts.
+pub fn build_ttc(font0: &[]u8, font1: &[]u8) -> []u8 {
+    header_sz := 12 + 2 * 4
+    off0 := header_sz
+    off1 := header_sz + font0.len
+    mut out := Buf::new()
+    out.push_tag("ttcf")
+    out.push_u16(1)
+    out.push_u16(0)
+    out.push_u32(2)
+    out.push_u32(u32(off0))
+    out.push_u32(u32(off1))
+    // Append font0 with table offsets shifted by off0
+    s0 := shift_sfnt_offsets(&font0, off0)
+    s1 := shift_sfnt_offsets(&font1, off1)
+    out.push_bytes(&s0)
+    out.push_bytes(&s1)
+    out.data
+}
+
+fn shift_sfnt_offsets(sfnt: &[]u8, base: i32) -> []u8 {
+    mut res := sfnt.clone()
+    n := bin.peek_u16(&res, 4)
+    for i in 0..n {
+        pos := 12 + i * 16 + 8
+        old := i32(bin.peek_u32(&res, pos))
+        nv := u32(old + base)
+        res[pos] = u8(nv.shr(24).bit_and(255))
+        res[pos + 1] = u8(nv.shr(16).bit_and(255))
+        res[pos + 2] = u8(nv.shr(8).bit_and(255))
+        res[pos + 3] = u8(nv.bit_and(255))
+    }
+    res
+}
+
+// --- Zlib/DEFLATE test encoders (stored + fixed-Huffman with LZ77 backreferences) ---
+
+fn adler32_bytes(data: &[]u8) -> u32 {
+    mut s1: u32 = 1
+    mut s2: u32 = 0
+    for b in &data {
+        s1 = (s1 + u32(b)) % 65521
+        s2 = (s2 + s1) % 65521
+    }
+    s2.shl(16).bit_or(s1)
+}
+
+pub fn zlib_store(raw: &[]u8) -> []u8 {
+    mut b := Buf::new()
+    b.push_u8(0x78)
+    b.push_u8(0x01)
+    b.push_u8(0x01) // BFINAL=1, BTYPE=00 stored
+    n := raw.len
+    b.push_u8(n.bit_and(255))
+    b.push_u8(n.shr(8).bit_and(255))
+    nlen := n.bit_xor(65535)
+    b.push_u8(nlen.bit_and(255))
+    b.push_u8(nlen.shr(8).bit_and(255))
+    b.push_bytes(&raw)
+    b.push_u32(adler32_bytes(&raw))
+    b.data
+}
+
+struct BitWriter {
+    bytes: []u8,
+    cur: i32,
+    nbits: i32,
+}
+
+impl BitWriter {
+    fn new() -> Self { Self { bytes: [], cur: 0, nbits: 0 } }
+
+    fn write_lsb(&mut self, val: i32, count: i32) {
+        for i in 0..count {
+            bit := val.shr(i).bit_and(1)
+            self.cur = self.cur.bit_or(bit.shl(self.nbits))
+            self.nbits += 1
+            if self.nbits == 8 {
+                self.bytes.push(u8(self.cur))
+                self.cur = 0
+                self.nbits = 0
+            }
+        }
+    }
+
+    fn write_msb(&mut self, code: i32, count: i32) {
+        for i in 0..count {
+            bit := code.shr(count - 1 - i).bit_and(1)
+            self.cur = self.cur.bit_or(bit.shl(self.nbits))
+            self.nbits += 1
+            if self.nbits == 8 {
+                self.bytes.push(u8(self.cur))
+                self.cur = 0
+                self.nbits = 0
+            }
+        }
+    }
+
+    fn write_fixed_lit(&mut self, sym: i32) {
+        if sym <= 143 {
+            self.write_msb(0x30 + sym, 8)
+        } else if sym <= 255 {
+            self.write_msb(0x190 + (sym - 144), 9)
+        } else if sym <= 279 {
+            self.write_msb(sym - 256, 7)
+        } else {
+            self.write_msb(0xC0 + (sym - 280), 8)
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.nbits > 0 {
+            self.bytes.push(u8(self.cur))
+            self.cur = 0
+            self.nbits = 0
+        }
+    }
+}
+
+pub fn zlib_compress_fixed_lz77(raw: &[]u8) -> []u8 {
+    // Emits a valid zlib BTYPE=1 (fixed Huffman) stream using simple LZ77 matching
+    // on distances 1..=32 and lengths 3..=10 (codes 257..=264).
+    mut bw := BitWriter::new()
+    bw.bytes.push(0x78)
+    bw.bytes.push(0x9C)
+    bw.write_lsb(1, 1) // BFINAL=1
+    bw.write_lsb(1, 2) // BTYPE=01 fixed Huffman
+
+    mut i := 0
+    while i < raw.len {
+        mut best_len := 0
+        mut best_dist := 0
+        mut max_d := if i < 32 { i } else { 32 }
+        for d in 1..(max_d + 1) {
+            mut mlen := 0
+            while mlen < 10 && i + mlen < raw.len && raw[i + mlen] == raw[i - d + mlen] {
+                mlen += 1
+            }
+            if mlen >= 3 && mlen > best_len {
+                best_len = mlen
+                best_dist = d
+            }
+        }
+        if best_len >= 3 {
+            // Length symbols 257..=264 have 0 extra bits for lengths 3..=10
+            bw.write_fixed_lit(257 + (best_len - 3))
+            // Encode distance 1..=32 (distance codes 0..=9 cover 1..=32)
+            mut dsym := 0
+            mut dbase := 1
+            mut dextra := 0
+            if best_dist == 1 { dsym = 0; dbase = 1; dextra = 0 }
+            else if best_dist == 2 { dsym = 1; dbase = 2; dextra = 0 }
+            else if best_dist == 3 { dsym = 2; dbase = 3; dextra = 0 }
+            else if best_dist == 4 { dsym = 3; dbase = 4; dextra = 0 }
+            else if best_dist <= 6 { dsym = 4; dbase = 5; dextra = 1 }
+            else if best_dist <= 8 { dsym = 5; dbase = 7; dextra = 1 }
+            else if best_dist <= 12 { dsym = 6; dbase = 9; dextra = 2 }
+            else if best_dist <= 16 { dsym = 7; dbase = 13; dextra = 2 }
+            else if best_dist <= 24 { dsym = 8; dbase = 17; dextra = 3 }
+            else { dsym = 9; dbase = 25; dextra = 3 }
+            bw.write_msb(dsym, 5)
+            if dextra > 0 { bw.write_lsb(best_dist - dbase, dextra) }
+            i += best_len
+        } else {
+            bw.write_fixed_lit(i32(raw[i]))
+            i += 1
+        }
+    }
+    bw.write_fixed_lit(256) // end of block
+    bw.finish()
+
+    ck := adler32_bytes(&raw)
+    bw.bytes.push(u8(ck.shr(24).bit_and(255)))
+    bw.bytes.push(u8(ck.shr(16).bit_and(255)))
+    bw.bytes.push(u8(ck.shr(8).bit_and(255)))
+    bw.bytes.push(u8(ck.bit_and(255)))
+    bw.bytes
+}
+
+// --- Core SFNT table builders ---
+
+pub fn tbl_head(upem: i32, loca_fmt: i32) -> []u8 {
+    mut b := Buf::new()
+    b.push_fixed(1.0)      // major.minor
+    b.push_fixed(1.0)      // fontRevision
+    b.push_u32(0)          // checkSumAdjustment
+    b.push_u32(0x5F0F3CF5) // magicNumber
+    b.push_u16(0)          // flags
+    b.push_u16(upem)
+    b.push_u32(0); b.push_u32(0) // created
+    b.push_u32(0); b.push_u32(0) // modified
+    b.push_i16(0); b.push_i16(-200); b.push_i16(900); b.push_i16(900)
+    b.push_u16(0)  // macStyle
+    b.push_u16(8)  // lowestRecPPEM
+    b.push_i16(2)  // fontDirectionHint
+    b.push_i16(loca_fmt)
+    b.push_i16(0)  // glyphDataFormat
+    b.data
+}
+
+pub fn tbl_maxp_ttf(num_glyphs: i32) -> []u8 {
+    mut b := Buf::new()
+    b.push_u32(0x00010000)
+    b.push_u16(num_glyphs)
+    for _ in 0..13 { b.push_u16(16) }
+    b.data
+}
+
+pub fn tbl_maxp_cff(num_glyphs: i32) -> []u8 {
+    mut b := Buf::new()
+    b.push_u32(0x00005000)
+    b.push_u16(num_glyphs)
+    b.data
+}
+
+pub fn tbl_hhea(asc: i32, desc: i32, gap: i32, n_hmetrics: i32) -> []u8 {
+    mut b := Buf::new()
+    b.push_fixed(1.0)
+    b.push_i16(asc)
+    b.push_i16(desc)
+    b.push_i16(gap)
+    b.push_u16(1000)
+    b.push_i16(-100)
+    b.push_i16(-100)
+    b.push_i16(1000)
+    b.push_i16(1)
+    b.push_i16(0)
+    b.push_i16(0)
+    for _ in 0..4 { b.push_i16(0) }
+    b.push_i16(0)
+    b.push_u16(n_hmetrics)
+    b.data
+}
+
+pub fn tbl_hmtx(advs: &[]i32, lsbs: &[]i32) -> []u8 {
+    mut b := Buf::new()
+    for i in 0..advs.len {
+        b.push_u16(advs[i])
+        b.push_i16(lsbs[i])
+    }
+    for i in advs.len..lsbs.len {
+        b.push_i16(lsbs[i])
+    }
+    b.data
+}
+
+pub fn tbl_os2(typo_asc: i32, typo_desc: i32, xh: i32, ch: i32) -> []u8 {
+    mut b := Buf::new()
+    b.push_u16(4)   // version 4
+    b.push_i16(500) // xAvgCharWidth
+    b.push_u16(400) // usWeightClass
+    b.push_u16(5)   // usWidthClass
+    b.push_u16(0)   // fsType
+    for _ in 0..10 { b.push_i16(0) } // subscript/superscript/strikeout
+    b.push_i16(0)   // sFamilyClass
+    for _ in 0..10 { b.push_u8(0) } // panose
+    for _ in 0..4 { b.push_u32(0) } // ulUnicodeRange
+    b.push_tag("TEST")
+    b.push_u16(0x0040) // REGULAR
+    b.push_u16(32)
+    b.push_u16(0x10FFFF)
+    b.push_i16(typo_asc)
+    b.push_i16(typo_desc)
+    b.push_i16(50)  // sTypoLineGap
+    b.push_u16(typo_asc + 100)
+    b.push_u16(-typo_desc + 50)
+    b.push_u32(0)
+    b.push_u32(0)
+    b.push_i16(xh)
+    b.push_i16(ch)
+    b.push_u16(0)
+    b.push_u16(0)
+    b.push_u16(0)
+    b.data
+}
+
+pub fn tbl_post(italic_angle: f64, underline_pos: i32, underline_thick: i32, fixed_pitch: bool) -> []u8 {
+    mut b := Buf::new()
+    b.push_fixed(3.0)
+    b.push_fixed(italic_angle)
+    b.push_i16(underline_pos)
+    b.push_i16(underline_thick)
+    b.push_u32(if fixed_pitch { 1 } else { 0 })
+    for _ in 0..4 { b.push_u32(0) }
+    b.data
+}
+
+pub fn tbl_name(family: string, style: string, ps_name: string, ver: string) -> []u8 {
+    // Emit 4 records: Windows UTF-16BE (pid=3, eid=1) for ids 1, 2, 4, 6 and 5 (version)
+    mut strs := Buf::new()
+    mut recs := Buf::new()
+    ids: []i32 = [1, 2, 4, 5, 6]
+    vals: []string = [family.clone(), style.clone(), family + " " + style, ver.clone(), ps_name.clone()]
+    for i in 0..ids.len {
+        off := strs.data.len
+        strs.push_utf16be(vals[i])
+        slen := strs.data.len - off
+        recs.push_u16(3)
+        recs.push_u16(1)
+        recs.push_u16(0x0409)
+        recs.push_u16(ids[i])
+        recs.push_u16(slen)
+        recs.push_u16(off)
+    }
+    mut out := Buf::new()
+    out.push_u16(0)
+    out.push_u16(ids.len)
+    out.push_u16(6 + recs.data.len)
+    out.push_bytes(&recs.data)
+    out.push_bytes(&strs.data)
+    out.data
+}
+
+// --- cmap table builder ---
+
+pub fn tbl_cmap_fmt4(cps: &[]i32, gids: &[]i32) -> []u8 {
+    // Simple Format 4 with 1 segment per codepoint + sentinel 0xFFFF
+    sub := build_cmap_sub_fmt4(&cps, &gids)
+    mut out := Buf::new()
+    out.push_u16(0) // version
+    out.push_u16(1) // numTables
+    out.push_u16(3) // pid Microsoft
+    out.push_u16(1) // eid Unicode BMP
+    out.push_u32(12)
+    out.push_bytes(&sub)
+    out.data
+}
+
+pub fn tbl_cmap_all_formats() -> []u8 {
+    // Combines subtables for Format 0, 4, 6, 12, and 14 (UVS) to test subtable priority & direct parsers.
+    mut s0 := Buf::new()
+    s0.push_u16(0)   // format 0
+    s0.push_u16(262) // len
+    s0.push_u16(0)   // lang
+    for cp in 0..256 {
+        s0.push_u8(if cp == 65 { 1 } else if cp == 66 { 2 } else { 0 })
+    }
+
+    // Format 6 (pid=1, eid=0 MacRoman -> rank lower than Unicode BMP/Full)
+    mut s6 := Buf::new()
+    s6.push_u16(6)
+    s6.push_u16(10 + 4)
+    s6.push_u16(0)
+    s6.push_u16(67) // firstCode 'C'
+    s6.push_u16(2)  // entryCount 'C', 'D'
+    s6.push_u16(3)
+    s6.push_u16(4)
+
+    // Format 4 (pid=3, eid=1): 'A'->1, 'B'->2, 'C'->3, 'D'->4 (mix idDelta and idRangeOffset!)
+    mut s4 := build_cmap_sub_fmt4_mixed()
+
+    // Format 12 (pid=3, eid=10): 'A'->1, 'B'->2, 'C'->3, 'V'->4, U+1F600 -> 5
+    mut s12 := Buf::new()
+    s12.push_u16(12)
+    s12.push_u16(0)
+    s12.push_u32(16 + 4 * 12)
+    s12.push_u32(0)
+    s12.push_u32(4) // numGroups
+    s12.push_u32(65); s12.push_u32(67); s12.push_u32(1)       // A,B,C -> 1,2,3
+    s12.push_u32(86); s12.push_u32(86); s12.push_u32(4)       // V -> 4
+    s12.push_u32(103); s12.push_u32(103); s12.push_u32(5)     // g -> 5
+    s12.push_u32(0x1F600); s12.push_u32(0x1F600); s12.push_u32(6) // U+1F600 -> 6
+
+    // Format 14 UVS (pid=0, eid=5): U+FE01 on U+0041 -> gid 9
+    mut s14 := Buf::new()
+    s14.push_u16(14)
+    s14.push_u32(10 + 11 + 8) // len
+    s14.push_u32(1)  // numVarSelectorRecords
+    s14.push_u24(0xFE01)
+    s14.push_u32(0)  // defaultUVSOffset
+    s14.push_u32(21) // nonDefaultUVSOffset
+    // nonDefaultUVSTable at offset 21: count(u32)=1, uv(u24)=65, gid(u16)=9
+    s14.push_u32(1)
+    s14.push_u24(65)
+    s14.push_u16(9)
+
+    // Directory of 5 encodings
+    dir_sz := 4 + 5 * 8
+    o0 := dir_sz
+    o6 := o0 + s0.data.len
+    o4 := o6 + s6.data.len
+    o12 := o4 + s4.len
+    o14 := o12 + s12.data.len
+
+    mut out := Buf::new()
+    out.push_u16(0)
+    out.push_u16(5)
+    out.push_u16(1); out.push_u16(2); out.push_u32(u32(o0))
+    out.push_u16(1); out.push_u16(0); out.push_u32(u32(o6))
+    out.push_u16(3); out.push_u16(1); out.push_u32(u32(o4))
+    out.push_u16(3); out.push_u16(10); out.push_u32(u32(o12))
+    out.push_u16(0); out.push_u16(5); out.push_u32(u32(o14))
+    out.push_bytes(&s0.data)
+    out.push_bytes(&s6.data)
+    out.push_bytes(&s4)
+    out.push_bytes(&s12.data)
+    out.push_bytes(&s14.data)
+    out.data
+}
+
+fn build_cmap_sub_fmt4(cps: &[]i32, gids: &[]i32) -> []u8 {
+    // cps must be strictly sorted ascending!
+    nseg := cps.len + 1
+    mut b := Buf::new()
+    b.push_u16(4)
+    b.push_u16(16 + nseg * 8)
+    b.push_u16(0)
+    b.push_u16(nseg * 2)
+    b.push_u16(2)
+    b.push_u16(0)
+    b.push_u16(0)
+    for c in &cps { b.push_u16(c) }
+    b.push_u16(0xFFFF)
+    b.push_u16(0)
+    for c in &cps { b.push_u16(c) }
+    b.push_u16(0xFFFF)
+    for i in 0..cps.len {
+        delta := (gids[i] - cps[i]).bit_and(0xFFFF)
+        b.push_i16(delta)
+    }
+    b.push_i16(1)
+    for _ in 0..nseg { b.push_u16(0) }
+    b.data
+}
+
+fn build_cmap_sub_fmt4_mixed() -> []u8 {
+    // Seg 0: 'A'..'B' -> gids 1..2 via idDelta
+    // Seg 1: 'C'..'D' -> gids 3..4 via idRangeOffset + glyphIdArray
+    // Seg 2: 0xFFFF -> gid 0
+    nseg := 3
+    mut b := Buf::new()
+    b.push_u16(4)
+    b.push_u16(16 + nseg * 8 + 4)
+    b.push_u16(0)
+    b.push_u16(nseg * 2)
+    b.push_u16(4)
+    b.push_u16(1)
+    b.push_u16(2)
+    // endCode
+    b.push_u16(66); b.push_u16(68); b.push_u16(0xFFFF)
+    b.push_u16(0)
+    // startCode
+    b.push_u16(65); b.push_u16(67); b.push_u16(0xFFFF)
+    // idDelta
+    b.push_i16(1 - 65); b.push_i16(0); b.push_i16(1)
+    // idRangeOffset: seg 1 is 2 bytes before end of idRangeOffset array -> +4 lands on glyphIdArray[0]
+    b.push_u16(0); b.push_u16(4); b.push_u16(0)
+    // glyphIdArray
+    b.push_u16(3); b.push_u16(4)
+    b.data
+}
+
+pub fn tbl_cmap_fmt4_mixed() -> []u8 {
+    sub := build_cmap_sub_fmt4_mixed()
+    mut out := Buf::new()
+    out.push_u16(0)
+    out.push_u16(1)
+    out.push_u16(3)
+    out.push_u16(1)
+    out.push_u32(12)
+    out.push_bytes(&sub)
+    out.data
+}
+
+// --- glyf + loca builder ---
+
+fn push_simple_glyph_rect(glyf: &mut Buf, x0: i32, y0: i32, x1: i32, y1: i32) {
+    // Single CW rectangle contour (positive x/y deltas using 2-byte deltas)
+    glyf.push_i16(1) // numContours
+    glyf.push_i16(x0); glyf.push_i16(y0); glyf.push_i16(x1); glyf.push_i16(y1)
+    glyf.push_u16(3) // endPts[0]
+    glyf.push_u16(0) // instructionLength
+    // 4 points, all on-curve (flag=1), 16-bit deltas (neither short nor same bits set)
+    for _ in 0..4 { glyf.push_u8(1) }
+    // x deltas: (x0, y0) -> (x0, y1) -> (x1, y1) -> (x1, y0)
+    glyf.push_i16(x0); glyf.push_i16(0); glyf.push_i16(x1 - x0); glyf.push_i16(0)
+    // y deltas:
+    glyf.push_i16(y0); glyf.push_i16(y1 - y0); glyf.push_i16(0); glyf.push_i16(y0 - y1)
+}
+
+fn push_hollow_glyph(glyf: &mut Buf) {
+    // Outer CW rectangle (100,0)-(600,600) + Inner CCW hole (220,140)-(480,460)
+    // Uses repeat flag, short-byte deltas, and zero/same deltas!
+    glyf.push_i16(2)
+    glyf.push_i16(100); glyf.push_i16(0); glyf.push_i16(600); glyf.push_i16(600)
+    glyf.push_u16(3)
+    glyf.push_u16(7)
+    glyf.push_u16(0) // instructions
+    // Flags: 8 points all on-curve with 2-byte deltas: bit0=1 | bit3(repeat)=8 -> count=7
+    glyf.push_u8(9); glyf.push_u8(7)
+    // Points 0..3 CW outer: (100,0), (100,600), (600,600), (600,0)
+    // Points 4..7 CCW inner: (220,140), (480,140), (480,460), (220,460)
+    // X deltas:
+    glyf.push_i16(100); glyf.push_i16(0); glyf.push_i16(500); glyf.push_i16(0)
+    glyf.push_i16(-380); glyf.push_i16(260); glyf.push_i16(0); glyf.push_i16(-260)
+    // Y deltas:
+    glyf.push_i16(0); glyf.push_i16(600); glyf.push_i16(0); glyf.push_i16(-600)
+    glyf.push_i16(140); glyf.push_i16(0); glyf.push_i16(320); glyf.push_i16(0)
+}
+
+fn push_quad_curve_glyph(glyf: &mut Buf) {
+    // Closed contour starting with off-curve control point + consecutive off-curve points
+    // Tests TrueType implicit midpoint emission & wrap-around start!
+    glyf.push_i16(1)
+    glyf.push_i16(50); glyf.push_i16(0); glyf.push_i16(550); glyf.push_i16(600)
+    glyf.push_u16(3)
+    glyf.push_u16(0)
+    // flags: p0 off-curve (0), p1 off-curve (0), p2 on-curve (1), p3 on-curve (1)
+    glyf.push_u8(0); glyf.push_u8(0); glyf.push_u8(1); glyf.push_u8(1)
+    // coords: (50, 300), (550, 600), (550, 0), (50, 0)
+    glyf.push_i16(50); glyf.push_i16(500); glyf.push_i16(0); glyf.push_i16(-500)
+    glyf.push_i16(300); glyf.push_i16(300); glyf.push_i16(-600); glyf.push_i16(0)
+}
+
+fn push_composite_glyph(glyf: &mut Buf) {
+    // Combines gid 1 shifted (0,0) + gid 1 shifted (150, 300) scaled by 0.5
+    glyf.push_i16(-1)
+    glyf.push_i16(100); glyf.push_i16(0); glyf.push_i16(600); glyf.push_i16(700)
+    // Component 0: gid 1, ARGS_ARE_XY_VALUES(2) | MORE_COMPONENTS(32) = 34, 8-bit args (0, 0)
+    glyf.push_u16(34)
+    glyf.push_u16(1)
+    glyf.push_i8(0); glyf.push_i8(0)
+    // Component 1: gid 1, ARG_1_AND_2_ARE_WORDS(1) | ARGS_ARE_XY_VALUES(2) | WE_HAVE_A_SCALE(8) = 11
+    glyf.push_u16(11)
+    glyf.push_u16(1)
+    glyf.push_i16(150); glyf.push_i16(300)
+    glyf.push_f2dot14(0.5)
+}
+
+pub struct GlyfLocaPair {
+    glyf: []u8,
+    loca_long: []u8,
+    loca_short: []u8,
+}
+
+pub fn build_sample_glyf_loca() -> GlyfLocaPair {
+    // 5 glyphs: gid 0 empty, gid 1 rect, gid 2 hollow rect, gid 3 quad arch, gid 4 composite
+    mut glyf := Buf::new()
+    mut offs: []i32 = []
+
+    offs.push(glyf.data.len) // gid 0 start (empty)
+    offs.push(glyf.data.len) // gid 1 start
+    push_simple_glyph_rect(&mut glyf, 100, 0, 500, 700)
+    while glyf.data.len % 2 != 0 { glyf.push_u8(0) }
+
+    offs.push(glyf.data.len) // gid 2 start
+    push_hollow_glyph(&mut glyf)
+    while glyf.data.len % 2 != 0 { glyf.push_u8(0) }
+
+    offs.push(glyf.data.len) // gid 3 start
+    push_quad_curve_glyph(&mut glyf)
+    while glyf.data.len % 2 != 0 { glyf.push_u8(0) }
+
+    offs.push(glyf.data.len) // gid 4 start
+    push_composite_glyph(&mut glyf)
+    while glyf.data.len % 2 != 0 { glyf.push_u8(0) }
+    offs.push(glyf.data.len) // sentinel
+
+    mut ll := Buf::new()
+    mut ls := Buf::new()
+    for o in &offs {
+        ll.push_u32(u32(o))
+        ls.push_u16(o / 2)
+    }
+    GlyfLocaPair { glyf: glyf.data, loca_long: ll.data, loca_short: ls.data }
+}
+
+// --- kern + GPOS builder ---
+
+pub fn tbl_kern_fmt0(lefts: &[]i32, rights: &[]i32, vals: &[]i32) -> []u8 {
+    mut b := Buf::new()
+    b.push_u16(0) // version
+    b.push_u16(1) // nTables
+    b.push_u16(0) // subtable version
+    b.push_u16(6 + 8 + lefts.len * 6)
+    b.push_u16(1) // fmt=0, horizontal=1
+    b.push_u16(lefts.len)
+    b.push_u16(6); b.push_u16(0); b.push_u16(0)
+    for i in 0..lefts.len {
+        b.push_u16(lefts[i])
+        b.push_u16(rights[i])
+        b.push_i16(vals[i])
+    }
+    b.data
+}
+
+pub fn tbl_gpos_pairpos() -> []u8 {
+    // GPOS with 'kern' feature -> Lookup 0 (Type 2 Format 1), Lookup 1 (Type 2 Format 2), Lookup 2 (Type 9 Ext -> Type 2 Format 1)
+    mut b := Buf::new()
+    // Header (10 bytes): script=0 (unused), feat=10, lookupList=42
+    feat_off := 10
+    // FeatureList at 10 (length 18): count(2)=1 + tag(4)='kern' + off(2)=8; FeatureTable at 18: params=0, lookupCount=3, [0,1,2]
+    lookup_off := 28
+
+    b.push_u16(1); b.push_u16(0) // v1.0
+    b.push_u16(0)                // scriptList
+    b.push_u16(feat_off)
+    b.push_u16(lookup_off)
+
+    // FeatureList at 10
+    b.push_u16(1)
+    b.push_tag("kern")
+    b.push_u16(8)
+    // FeatureTable at 18
+    b.push_u16(0)
+    b.push_u16(3)
+    b.push_u16(0); b.push_u16(1); b.push_u16(2)
+
+    // Build Lookup 0 (PairPos Format 1: gid 1 + gid 2 -> -85, gid 1 + gid 3 -> -40)
+    mut sub0 := Buf::new()
+    sub0.push_u16(1)  // format 1
+    sub0.push_u16(12) // cov offset -> +12
+    sub0.push_u16(4)  // vf1 = XAdvance
+    sub0.push_u16(0)  // vf2 = 0
+    sub0.push_u16(1)  // pairSetCount
+    sub0.push_u16(18) // pairSetOffset[0] -> +18
+    // Coverage Format 1 at +12 (6 bytes): fmt=1, count=1, [1]
+    sub0.push_u16(1); sub0.push_u16(1); sub0.push_u16(1)
+    // PairSet[0] at +18: pairCount=2, [(2, -85), (3, -40)]
+    sub0.push_u16(2)
+    sub0.push_u16(2); sub0.push_i16(-85)
+    sub0.push_u16(3); sub0.push_i16(-40)
+
+    // Build Lookup 1 (PairPos Format 2: Class1 {gid 4 -> class 1}, Class2 {gid 1 -> class 1}, adj = -120)
+    mut sub1 := Buf::new()
+    sub1.push_u16(2)  // format 2
+    sub1.push_u16(24) // cov offset -> +24
+    sub1.push_u16(4)  // vf1 = XAdvance
+    sub1.push_u16(0)  // vf2 = 0
+    sub1.push_u16(30) // classDef1 -> +30
+    sub1.push_u16(38) // classDef2 -> +38
+    sub1.push_u16(2)  // class1Count (0, 1)
+    sub1.push_u16(2)  // class2Count (0, 1)
+    // 2x2 matrix (4 * 2 bytes = 8 bytes): [0,0, 0,-120]
+    sub1.push_i16(0); sub1.push_i16(0)
+    sub1.push_i16(0); sub1.push_i16(-120)
+    // Coverage Format 1 at +24 (6 bytes): fmt=1, count=1, [4]
+    sub1.push_u16(1); sub1.push_u16(1); sub1.push_u16(4)
+    // ClassDef1 Format 1 at +30 (8 bytes): fmt=1, startGid=4, count=1, [1]
+    sub1.push_u16(1); sub1.push_u16(4); sub1.push_u16(1); sub1.push_u16(1)
+    // ClassDef2 Format 1 at +38 (8 bytes): fmt=1, startGid=1, count=1, [1]
+    sub1.push_u16(1); sub1.push_u16(1); sub1.push_u16(1); sub1.push_u16(1)
+
+    // Build Lookup 2 (Extension Type 9 -> Format 1 for gid 5 + gid 1 -> +55)
+    mut sub2_inner := Buf::new()
+    sub2_inner.push_u16(1); sub2_inner.push_u16(12); sub2_inner.push_u16(4); sub2_inner.push_u16(0)
+    sub2_inner.push_u16(1); sub2_inner.push_u16(18)
+    sub2_inner.push_u16(1); sub2_inner.push_u16(1); sub2_inner.push_u16(5)
+    sub2_inner.push_u16(1); sub2_inner.push_u16(1); sub2_inner.push_i16(55)
+
+    // Assemble LookupList at offset 26
+    // LookupList: count(2)=3 + off[0,1,2](6) = 8 bytes header
+    l0_rel := 8
+    l0_hdr_sz := 8 // type(2)+flag(2)+subCount(2)+subOff(2)
+    l1_rel := l0_rel + l0_hdr_sz + sub0.data.len
+    l2_rel := l1_rel + l0_hdr_sz + sub1.data.len
+
+    b.push_u16(3)
+    b.push_u16(l0_rel); b.push_u16(l1_rel); b.push_u16(l2_rel)
+    // Lookup 0
+    b.push_u16(2); b.push_u16(0); b.push_u16(1); b.push_u16(8)
+    b.push_bytes(&sub0.data)
+    // Lookup 1
+    b.push_u16(2); b.push_u16(0); b.push_u16(1); b.push_u16(8)
+    b.push_bytes(&sub1.data)
+    // Lookup 2 (Ext 9 + 8-byte ExtSubtable pointing +8 to sub2_inner)
+    b.push_u16(9); b.push_u16(0); b.push_u16(1); b.push_u16(8)
+    b.push_u16(1); b.push_u16(2); b.push_u32(8)
+    b.push_bytes(&sub2_inner.data)
+    b.data
+}
+
+// --- Variable font table builders: fvar, avar, HVAR, gvar ---
+
+pub fn tbl_fvar_wght() -> []u8 {
+    mut b := Buf::new()
+    b.push_u16(1); b.push_u16(0) // v1.0
+    b.push_u16(16)               // axesArrayOffset
+    b.push_u16(2)                // reserved=2
+    b.push_u16(1)                // axisCount
+    b.push_u16(20)               // axisSize
+    b.push_u16(1)                // instanceCount
+    b.push_u16(8)                // instanceSize (4 + axisCount*4)
+    // Axis 'wght': 100 .. 400 .. 900
+    b.push_tag("wght")
+    b.push_fixed(100.0)
+    b.push_fixed(400.0)
+    b.push_fixed(900.0)
+    b.push_u16(0); b.push_u16(256)
+    // Instance: Bold 700
+    b.push_u16(257); b.push_u16(0); b.push_fixed(700.0)
+    b.data
+}
+
+pub fn tbl_avar_nonlinear() -> []u8 {
+    // 1 axis, 4 map pairs: (-1 -> -1), (0 -> 0), (0.5 -> 0.25), (1 -> 1)
+    mut b := Buf::new()
+    b.push_u16(1); b.push_u16(0)
+    b.push_u16(0); b.push_u16(1)
+    b.push_u16(4)
+    b.push_f2dot14(-1.0); b.push_f2dot14(-1.0)
+    b.push_f2dot14(0.0);  b.push_f2dot14(0.0)
+    b.push_f2dot14(0.5);  b.push_f2dot14(0.25)
+    b.push_f2dot14(1.0);  b.push_f2dot14(1.0)
+    b.data
+}
+
+pub fn tbl_ivs_single_axis(delta_g0: i32, delta_g1: i32) -> []u8 {
+    // ItemVariationStore Format 1, 1 axis, 1 region (peak=1.0), 1 ItemVariationData subtable with 2 items
+    // Header: fmt(2)=1, regListOff(4)=12, dataCount(2)=1, dataOff[0](4)=22 -> 12 bytes
+    // RegList at 12: axisCount(2)=1, regionCount(2)=1, region(start=0, peak=1, end=1: 6 bytes) -> 10 bytes (ends at 22)
+    // ItemVariationData at 22: itemCount(2)=2, shortDeltaCount(2)=1, regIdxCount(2)=1, regIdx[0](2)=0, delta[0](2), delta[1](2)
+    mut b := Buf::new()
+    b.push_u16(1)
+    b.push_u32(12)
+    b.push_u16(1)
+    b.push_u32(22)
+    b.push_u16(1); b.push_u16(1)
+    b.push_f2dot14(0.0); b.push_f2dot14(1.0); b.push_f2dot14(1.0)
+    b.push_u16(2); b.push_u16(1); b.push_u16(1); b.push_u16(0)
+    b.push_i16(delta_g0)
+    b.push_i16(delta_g1)
+    b.data
+}
+
+pub fn tbl_hvar_sample() -> []u8 {
+    ivs := tbl_ivs_single_axis(0, 120)
+    // HVAR header (20 bytes): major, minor, ivsOff=20, advMapOff=20+ivs.len, lsbMap=0, rsbMap=0
+    mut b := Buf::new()
+    b.push_u16(1); b.push_u16(0)
+    b.push_u32(20)
+    b.push_u32(u32(20 + ivs.len))
+    b.push_u32(0); b.push_u32(0)
+    b.push_bytes(&ivs)
+    // DeltaSetIndexMap Format 0: fmt=0, entryFmt=0x03 (1 byte per entry, innerBits=4), count=2, entries=[0x00, 0x01]
+    b.push_u8(0); b.push_u8(0x03); b.push_u16(2)
+    b.push_u8(0); b.push_u8(1)
+    b.data
+}
+
+pub fn tbl_gvar_sample(num_glyphs: i32) -> []u8 {
+    // gvar applying (+80, +100) to gid 1 point 2 (top-right corner) and (+120, 0) to phantom point 5 (advance)
+    // at axis peak = 1.0
+    mut g1 := Buf::new()
+    // TupleVariationHeader for glyph 1:
+    // tupleCount=1, dataOffset=10 (4 header + 6 tuple header)
+    g1.push_u16(1)
+    g1.push_u16(10)
+    // TupleVariationHeader: varDataSize(2), tupleIndex(2)=0x8000 (EMBEDDED_PEAK_TUPLE) | 0x2000 (PRIVATE_POINT_NUMBERS), peakTuple(2)
+    // Serialized data: packed points [count=2, 0x01(2 deltas), pt=2, pt=5 (delta=3)], packed x-deltas: [0x01(count-1), 80, 120], packed y-deltas: [0x01, 100, 0]
+    mut ser := Buf::new()
+    // Points: 2 points: 2, 5
+    ser.push_u8(2)
+    ser.push_u8(1) // byte run of 2 points
+    ser.push_u8(2); ser.push_u8(3) // 2, 2+3=5
+    // X deltas (2 signed bytes -> run len-1 = 1)
+    ser.push_u8(1); ser.push_i8(80); ser.push_i8(120)
+    // Y deltas
+    ser.push_u8(1); ser.push_i8(100); ser.push_i8(0)
+
+    g1.push_u16(ser.data.len)
+    g1.push_u16(0xA000)
+    g1.push_f2dot14(1.0)
+    g1.push_bytes(&ser.data)
+    while g1.data.len % 2 != 0 { g1.push_u8(0) }
+
+    hdr_sz := 20 + (num_glyphs + 1) * 4
+    mut b := Buf::new()
+    b.push_u16(1); b.push_u16(0)
+    b.push_u16(1)           // axisCount
+    b.push_u16(0)           // sharedTupleCount
+    b.push_u32(u32(hdr_sz)) // sharedTuplesOffset
+    b.push_u16(num_glyphs)
+    b.push_u16(1)           // flags=1 -> 32-bit offsets
+    b.push_u32(u32(hdr_sz)) // glyphVariationDataArrayOffset
+    // Offsets: gid 0 empty (0..0), gid 1 (0..g1.len), gid 2.. empty
+    b.push_u32(0)
+    b.push_u32(0)
+    for _ in 1..num_glyphs { b.push_u32(u32(g1.data.len)) }
+    b.push_bytes(&g1.data)
+    b.data
+}
+
+// --- CPAL + COLR v0 builders ---
+
+pub fn tbl_cpal_sample() -> []u8 {
+    // 2 palettes, 2 entries each, plus palette entries stored as BGRA
+    mut b := Buf::new()
+    b.push_u16(0)  // version
+    b.push_u16(2)  // numPaletteEntries
+    b.push_u16(2)  // numPalettes
+    b.push_u16(4)  // numColorRecords
+    b.push_u32(16) // offsetFirstColorRecord (12 + 2*2)
+    b.push_u16(0); b.push_u16(2)
+    // Palette 0: entry 0 = Red (B=0,G=0,R=255,A=255), entry 1 = Blue (B=255,G=128,R=0,A=255)
+    b.push_u8(0); b.push_u8(0); b.push_u8(255); b.push_u8(255)
+    b.push_u8(255); b.push_u8(128); b.push_u8(0); b.push_u8(255)
+    // Palette 1: entry 0 = Green (0,255,0,255), entry 1 = White semi (255,255,255,128)
+    b.push_u8(0); b.push_u8(255); b.push_u8(0); b.push_u8(255)
+    b.push_u8(255); b.push_u8(255); b.push_u8(255); b.push_u8(128)
+    b.data
+}
+
+pub fn tbl_colr_v0_sample() -> []u8 {
+    // Base glyph 1 -> 3 layers: (gid 2, pal 0), (gid 3, pal 1), (gid 4, pal 0xFFFF foreground)
+    mut b := Buf::new()
+    b.push_u16(0)  // version 0
+    b.push_u16(1)  // numBaseGlyphRecords
+    b.push_u32(14) // baseGlyphRecordsOffset
+    b.push_u32(20) // layerRecordsOffset
+    b.push_u16(3)  // numLayerRecords
+    // BaseGlyphRecord: gid=1, first=0, num=3
+    b.push_u16(1); b.push_u16(0); b.push_u16(3)
+    // LayerRecords:
+    b.push_u16(2); b.push_u16(0)
+    b.push_u16(3); b.push_u16(1)
+    b.push_u16(4); b.push_u16(0xFFFF)
+    b.data
+}
+
+// --- CFF & CFF2 encoders ---
+
+fn push_cff_int32(b: &mut Buf, v: i32) {
+    b.push_u8(29)
+    b.push_i32(v)
+}
+
+fn push_cff_index(b: &mut Buf, items_flat: &[]u8, item_starts: &[]i32, is_cff2: bool) {
+    count := item_starts.len - 1
+    if is_cff2 {
+        b.push_u32(u32(count))
+    } else {
+        b.push_u16(count)
+    }
+    if count == 0 { return }
+    b.push_u8(4) // 4-byte offsets for exact simplicity
+    for s in &item_starts {
+        b.push_u32(u32(s + 1)) // 1-based CFF INDEX offsets
+    }
+    b.push_bytes(&items_flat)
+}
+
+fn push_type2_int(b: &mut Buf, v: i32) {
+    if v >= -107 && v <= 107 {
+        b.push_u8(v + 139)
+    } else if v >= 108 && v <= 1131 {
+        d := v - 108
+        b.push_u8(d / 256 + 247)
+        b.push_u8(d % 256)
+    } else if v <= -108 && v >= -1131 {
+        d := -v - 108
+        b.push_u8(d / 256 + 251)
+        b.push_u8(d % 256)
+    } else {
+        b.push_u8(28)
+        b.push_i16(v)
+    }
+}
+
+pub fn tbl_cff_sample() -> []u8 {
+    // CFF v1 with 3 glyphs:
+    // gid 0 (.notdef): empty endchar
+    // gid 1 ('A'): calls global subr #0 + local subr #0 to draw rectangle using rmoveto/hlineto/vlineto/endchar
+    // gid 2 ('B'): cubic curve contour using rrcurveto + endchar (and Private nominalWidthX + width stack arg!)
+    mut gsubr0 := Buf::new()
+    push_type2_int(&mut gsubr0, 500)
+    gsubr0.push_u8(6) // hlineto(500)
+    gsubr0.push_u8(11) // return
+
+    mut lsubr0 := Buf::new()
+    push_type2_int(&mut lsubr0, 600)
+    lsubr0.push_u8(7) // vlineto(600)
+    lsubr0.push_u8(11) // return
+
+    // Global Subrs INDEX (1 item)
+    mut gs_idx := Buf::new()
+    gs_offs: []i32 = [0, gsubr0.data.len]
+    push_cff_index(&mut gs_idx, &gsubr0.data, &gs_offs, false)
+
+    // Local Subrs INDEX (1 item)
+    mut ls_idx := Buf::new()
+    ls_offs: []i32 = [0, lsubr0.data.len]
+    push_cff_index(&mut ls_idx, &lsubr0.data, &ls_offs, false)
+
+    // CharStrings: gid 0, gid 1, gid 2
+    mut cs0 := Buf::new()
+    cs0.push_u8(14) // endchar
+
+    mut cs1 := Buf::new()
+    // Explicit width delta (+100 -> 500 + 100 = 600), then rmoveto(50, 0), callgsubr(-107+0=-107), callsubr(-107+0=-107), hlineto(-500), endchar
+    push_type2_int(&mut cs1, 100) // odd arg count for rmoveto -> width!
+    push_type2_int(&mut cs1, 50)
+    push_type2_int(&mut cs1, 0)
+    cs1.push_u8(21) // rmoveto
+    push_type2_int(&mut cs1, -107)
+    cs1.push_u8(29) // callgsubr
+    push_type2_int(&mut cs1, -107)
+    cs1.push_u8(10) // callsubr
+    push_type2_int(&mut cs1, -500)
+    cs1.push_u8(6) // hlineto
+    cs1.push_u8(14) // endchar
+
+    mut cs2 := Buf::new()
+    push_type2_int(&mut cs2, 100); push_type2_int(&mut cs2, 0); cs2.push_u8(21) // rmoveto
+    // rrcurveto: dx1=0, dy1=300, dx2=300, dy2=300, dx3=200, dy3=0
+    push_type2_int(&mut cs2, 0); push_type2_int(&mut cs2, 300)
+    push_type2_int(&mut cs2, 300); push_type2_int(&mut cs2, 300)
+    push_type2_int(&mut cs2, 200); push_type2_int(&mut cs2, 0)
+    cs2.push_u8(8) // rrcurveto
+    push_type2_int(&mut cs2, -600); cs2.push_u8(7) // vlineto
+    cs2.push_u8(14) // endchar
+
+    mut cs_flat := Buf::new()
+    s0 := cs_flat.data.len; cs_flat.push_bytes(&cs0.data)
+    s1 := cs_flat.data.len; cs_flat.push_bytes(&cs1.data)
+    s2 := cs_flat.data.len; cs_flat.push_bytes(&cs2.data)
+    s3 := cs_flat.data.len
+    mut cs_idx := Buf::new()
+    cs_offs: []i32 = [s0, s1, s2, s3]
+    push_cff_index(&mut cs_idx, &cs_flat.data, &cs_offs, false)
+
+    // Private DICT (nominalWidthX=500, defaultWidthX=400, subrs offset -> right after Private DICT)
+    // Reserve fixed-size 5-byte ints so offset math is exact!
+    mut priv_dict := Buf::new()
+    push_cff_int32(&mut priv_dict, 400); priv_dict.push_u8(20) // defaultWidthX
+    push_cff_int32(&mut priv_dict, 500); priv_dict.push_u8(21) // nominalWidthX
+    push_cff_int32(&mut priv_dict, 18); priv_dict.push_u8(19)  // Subrs = 18 bytes from start of Private DICT (3 * 6 bytes!)
+
+    // Top DICT fixed 17 bytes: CharStrings (6 bytes), Private size+off (11 bytes)
+    top_dict_len := 17
+    mut hdr_and_names := Buf::new()
+    hdr_and_names.push_u8(1); hdr_and_names.push_u8(0); hdr_and_names.push_u8(4); hdr_and_names.push_u8(4)
+    // Name INDEX (1 item "TestCFF")
+    name_b := "TestCFF"
+    mut nm_raw := Buf::new(); nm_raw.push_str_bytes(name_b)
+    nm_offs: []i32 = [0, nm_raw.data.len]
+    push_cff_index(&mut hdr_and_names, &nm_raw.data, &nm_offs, false)
+    // Top DICT INDEX placeholder
+    top_idx_start := hdr_and_names.data.len
+    mut dummy_top := Buf::new()
+    for _ in 0..top_dict_len { dummy_top.push_u8(0) }
+    mut after_top := Buf::new()
+    td_offs: []i32 = [0, top_dict_len]
+    push_cff_index(&mut after_top, &dummy_top.data, &td_offs, false)
+    // String INDEX (empty)
+    empty_u8: []u8 = []
+    zero_offs: []i32 = [0]
+    push_cff_index(&mut after_top, &empty_u8, &zero_offs, false)
+    // Global Subrs INDEX
+    after_top.push_bytes(&gs_idx.data)
+
+    cs_offset := top_idx_start + after_top.data.len
+    priv_offset := cs_offset + cs_idx.data.len
+
+    mut top_dict := Buf::new()
+    push_cff_int32(&mut top_dict, cs_offset); top_dict.push_u8(17) // CharStrings
+    push_cff_int32(&mut top_dict, priv_dict.data.len)
+    push_cff_int32(&mut top_dict, priv_offset); top_dict.push_u8(18) // Private (size, offset)
+
+    mut out := Buf::new()
+    out.push_bytes(&hdr_and_names.data)
+    real_td_offs: []i32 = [0, top_dict.data.len]
+    push_cff_index(&mut out, &top_dict.data, &real_td_offs, false)
+    push_cff_index(&mut out, &empty_u8, &zero_offs, false)
+    out.push_bytes(&gs_idx.data)
+    out.push_bytes(&cs_idx.data)
+    out.push_bytes(&priv_dict.data)
+    out.push_bytes(&ls_idx.data)
+    out.data
+}
+
+pub fn tbl_cff2_sample() -> []u8 {
+    // CFF2 table with 2 glyphs, 1 axis ('wght'), and ItemVariationStore + `blend` operator!
+    // gid 1 draws box (100,0)-(400 + 200*wght_norm, 600)
+    // Type2 with blend: x0=100, y0=0 -> rmoveto; x_base=300, d0=200, n=1 -> blend(16), hlineto(6); ...
+    ivs := tbl_ivs_single_axis(0, 0) // region 0 peak=1.0 on 1 axis
+
+    mut cs0 := Buf::new() // empty gid 0
+    mut cs1 := Buf::new()
+    push_type2_int(&mut cs1, 100); push_type2_int(&mut cs1, 0); cs1.push_u8(21) // rmoveto(100,0)
+    push_type2_int(&mut cs1, 300); push_type2_int(&mut cs1, 200); push_type2_int(&mut cs1, 1); cs1.push_u8(16) // blend -> 300 + 200*scalar
+    cs1.push_u8(6) // hlineto
+    push_type2_int(&mut cs1, 600); cs1.push_u8(7) // vlineto
+    push_type2_int(&mut cs1, -300); push_type2_int(&mut cs1, -200); push_type2_int(&mut cs1, 1); cs1.push_u8(16) // blend back
+    cs1.push_u8(6) // hlineto
+    // implicit endchar in CFF2!
+
+    mut cs_flat := Buf::new()
+    s0 := cs_flat.data.len; cs_flat.push_bytes(&cs0.data)
+    s1 := cs_flat.data.len; cs_flat.push_bytes(&cs1.data)
+    s2 := cs_flat.data.len
+    mut cs_idx := Buf::new()
+    cs_offs: []i32 = [s0, s1, s2]
+    push_cff_index(&mut cs_idx, &cs_flat.data, &cs_offs, true)
+
+    mut gs_idx := Buf::new()
+    empty_u8: []u8 = []
+    zero_offs: []i32 = [0]
+    push_cff_index(&mut gs_idx, &empty_u8, &zero_offs, true) // empty CFF2 Global Subrs INDEX (4 bytes count=0)
+
+    top_dict_len := 12 // CharStrings(6) + vstore(6)
+    cs_off := 5 + top_dict_len + gs_idx.data.len
+    vstore_off := cs_off + cs_idx.data.len
+
+    mut out := Buf::new()
+    out.push_u8(2); out.push_u8(0); out.push_u8(5) // CFF2 v2.0, hdrSize=5
+    out.push_u16(top_dict_len)
+    push_cff_int32(&mut out, cs_off); out.push_u8(17)    // CharStrings
+    push_cff_int32(&mut out, vstore_off); out.push_u8(24) // vstore
+    out.push_bytes(&gs_idx.data)
+    out.push_bytes(&cs_idx.data)
+    out.push_u16(ivs.len)
+    out.push_bytes(&ivs)
+    out.data
+}
+
+// --- Full synthetic SFNT font builders ---
+
+pub fn build_synthetic_ttf(include_var: bool, include_color: bool) -> []u8 {
+    gl := build_sample_glyf_loca()
+    mut pk := TablePack::new()
+    pk.add_owned("head", tbl_head(1000, 1))
+    pk.add_owned("maxp", tbl_maxp_ttf(5))
+    pk.add_owned("hhea", tbl_hhea(800, -200, 100, 2))
+    // 5 glyphs, numberOfHMetrics=2 -> gids 1..4 share advance 600
+    hmtx_adv: []i32 = [500, 600]
+    hmtx_lsb: []i32 = [0, 100, 100, 50, 100]
+    pk.add_owned("hmtx", tbl_hmtx(&hmtx_adv, &hmtx_lsb))
+    pk.add_owned("OS/2", tbl_os2(750, -250, 500, 700))
+    pk.add_owned("post", tbl_post(-12.0, -100, 50, false))
+    pk.add_owned("name", tbl_name("SkriftTest", "Regular", "SkriftTest-Regular", "Version 1.0"))
+    pk.add_owned("cmap", tbl_cmap_all_formats())
+    pk.add("loca", &gl.loca_long)
+    pk.add("glyf", &gl.glyf)
+    kl: []i32 = [1, 2]; kr: []i32 = [2, 3]; kv: []i32 = [-50, -25]
+    pk.add_owned("kern", tbl_kern_fmt0(&kl, &kr, &kv))
+    pk.add_owned("GPOS", tbl_gpos_pairpos())
+    if include_var {
+        pk.add_owned("fvar", tbl_fvar_wght())
+        pk.add_owned("avar", tbl_avar_nonlinear())
+        pk.add_owned("HVAR", tbl_hvar_sample())
+        pk.add_owned("gvar", tbl_gvar_sample(5))
+    }
+    if include_color {
+        pk.add_owned("CPAL", tbl_cpal_sample())
+        pk.add_owned("COLR", tbl_colr_v0_sample())
+    }
+    pk.build_sfnt(0x00010000)
+}
+
+pub fn build_synthetic_otf_cff() -> []u8 {
+    mut pk := TablePack::new()
+    pk.add_owned("head", tbl_head(1000, 0))
+    pk.add_owned("maxp", tbl_maxp_cff(3))
+    pk.add_owned("hhea", tbl_hhea(800, -200, 0, 3))
+    ha: []i32 = [500, 600, 700]; hl: []i32 = [0, 50, 100]
+    pk.add_owned("hmtx", tbl_hmtx(&ha, &hl))
+    pk.add_owned("name", tbl_name("SkriftCFF", "Regular", "SkriftCFF-Regular", "1.0"))
+    cc: []i32 = [65, 66]; cg: []i32 = [1, 2]
+    pk.add_owned("cmap", tbl_cmap_fmt4(&cc, &cg))
+    pk.add_owned("CFF ", tbl_cff_sample())
+    pk.build_sfnt(0x4F54544F) // OTTO
+}
+
+pub fn build_synthetic_otf_cff2() -> []u8 {
+    mut pk := TablePack::new()
+    pk.add_owned("head", tbl_head(1000, 0))
+    pk.add_owned("maxp", tbl_maxp_cff(2))
+    pk.add_owned("hhea", tbl_hhea(800, -200, 0, 2))
+    ha: []i32 = [500, 600]; hl: []i32 = [0, 100]
+    pk.add_owned("hmtx", tbl_hmtx(&ha, &hl))
+    pk.add_owned("name", tbl_name("SkriftCFF2", "Variable", "SkriftCFF2-Variable", "2.0"))
+    cc: []i32 = [65]; cg: []i32 = [1]
+    pk.add_owned("cmap", tbl_cmap_fmt4(&cc, &cg))
+    pk.add_owned("fvar", tbl_fvar_wght())
+    pk.add_owned("CFF2", tbl_cff2_sample())
+    pk.build_sfnt(0x4F54544F) // OTTO
+}
+
+pub fn build_synthetic_woff1(compressed: bool) -> []u8 {
+    gl := build_sample_glyf_loca()
+    // Pad glyf with trailing repeated zeros so fixed LZ77 compresses well when compressed=true
+    mut big_name := tbl_name("SkriftWoff", "Regular", "SkriftWoff-Regular", "1.0")
+    mut b := Buf::new()
+    b.push_bytes(&big_name)
+    for _ in 0..80 { b.push_u8(0x41) }
+    mut pk := TablePack::new()
+    pk.add_owned("head", tbl_head(1000, 1))
+    pk.add_owned("maxp", tbl_maxp_ttf(5))
+    pk.add_owned("hhea", tbl_hhea(800, -200, 0, 2))
+    ha: []i32 = [500, 600]; hl: []i32 = [0, 100, 100, 50, 100]
+    pk.add_owned("hmtx", tbl_hmtx(&ha, &hl))
+    pk.add("name", &b.data)
+    cc: []i32 = [65, 66]; cg: []i32 = [1, 2]
+    pk.add_owned("cmap", tbl_cmap_fmt4(&cc, &cg))
+    pk.add("loca", &gl.loca_long)
+    pk.add("glyf", &gl.glyf)
+    pk.build_woff1(0x00010000, if compressed { 2 } else { 0 })
+}
+
+pub fn build_synthetic_otf_cid_fdselect3() -> []u8 {
+    // CFF v1 CID-style font with FDArray (2 Private dicts) + FDSelect Format 3:
+    // gid 0 -> FD 0; gid 1 -> FD 0 (uses hmoveto with explicit width, hflex);
+    // gid 2 -> FD 1 (uses Local Subr #0 from FD 1 + hvcurveto).
+    mut lsubr_fd0 := Buf::new()
+    push_type2_int(&mut lsubr_fd0, 400); lsubr_fd0.push_u8(7) // vlineto(400)
+    lsubr_fd0.push_u8(11)
+
+    mut lsubr_fd1 := Buf::new()
+    push_type2_int(&mut lsubr_fd1, 700); lsubr_fd1.push_u8(7) // vlineto(700)
+    lsubr_fd1.push_u8(11)
+
+    mut ls0_idx := Buf::new()
+    ls0_offs: []i32 = [0, lsubr_fd0.data.len]
+    push_cff_index(&mut ls0_idx, &lsubr_fd0.data, &ls0_offs, false)
+
+    mut ls1_idx := Buf::new()
+    ls1_offs: []i32 = [0, lsubr_fd1.data.len]
+    push_cff_index(&mut ls1_idx, &lsubr_fd1.data, &ls1_offs, false)
+
+    // Private DICTs (each 6 bytes for Subrs rel offset -> 6!)
+    mut priv0 := Buf::new(); push_cff_int32(&mut priv0, 6); priv0.push_u8(19)
+    mut priv1 := Buf::new(); push_cff_int32(&mut priv1, 6); priv1.push_u8(19)
+
+    // CharStrings
+    mut cs0 := Buf::new(); cs0.push_u8(14)
+    mut cs1 := Buf::new()
+    // width=80 (even count for hmoveto: [80, 50]), then hflex [100, 100, 40, 100, 100, 100, 100], vlineto(-400), endchar
+    push_type2_int(&mut cs1, 80); push_type2_int(&mut cs1, 50); cs1.push_u8(22) // hmoveto(x=50, y=0)
+    push_type2_int(&mut cs1, -107); cs1.push_u8(10) // callsubr(0) -> FD 0 subr -> y=400!
+    // hvcurveto: dx1=200, dx2=100, dy2=100, dy3=0
+    push_type2_int(&mut cs1, 200); push_type2_int(&mut cs1, 100); push_type2_int(&mut cs1, 100); push_type2_int(&mut cs1, 0); cs1.push_u8(31)
+    cs1.push_u8(14)
+
+    mut cs2 := Buf::new()
+    push_type2_int(&mut cs2, 100); cs2.push_u8(22) // hmoveto(100)
+    push_type2_int(&mut cs2, -107); cs2.push_u8(10) // callsubr(0) -> FD 1 subr -> y=700!
+    cs2.push_u8(14)
+
+    mut cs_flat := Buf::new()
+    s0 := cs_flat.data.len; cs_flat.push_bytes(&cs0.data)
+    s1 := cs_flat.data.len; cs_flat.push_bytes(&cs1.data)
+    s2 := cs_flat.data.len; cs_flat.push_bytes(&cs2.data)
+    s3 := cs_flat.data.len
+    mut cs_idx := Buf::new()
+    cs_offs: []i32 = [s0, s1, s2, s3]
+    push_cff_index(&mut cs_idx, &cs_flat.data, &cs_offs, false)
+
+    // FDSelect Format 3: fmt=3(1), nRanges=2(2), (first=0, fd=0)(3), (first=2, fd=1)(3), sentinel=3(2) -> 11 bytes
+    mut fd_sel := Buf::new()
+    fd_sel.push_u8(3); fd_sel.push_u16(2)
+    fd_sel.push_u16(0); fd_sel.push_u8(0)
+    fd_sel.push_u16(2); fd_sel.push_u8(1)
+    fd_sel.push_u16(3)
+
+    // Precompute CFF layout with fixed-width 5-byte TopDICT/FDArray ints (each entry = 6 bytes!)
+    // TopDICT: CharStrings(6), FDArray(7: 29 i32 + 12 36), FDSelect(7: 29 i32 + 12 37) = 20 bytes
+    top_dict_len := 20
+    mut hdr_prefix := Buf::new()
+    hdr_prefix.push_u8(1); hdr_prefix.push_u8(0); hdr_prefix.push_u8(4); hdr_prefix.push_u8(4)
+    nm := "TestCID"
+    mut nm_raw := Buf::new(); nm_raw.push_str_bytes(nm)
+    nm_offs: []i32 = [0, nm_raw.data.len]
+    push_cff_index(&mut hdr_prefix, &nm_raw.data, &nm_offs, false)
+    top_idx_pos := hdr_prefix.data.len
+
+    empty_u8: []u8 = []
+    zero_offs: []i32 = [0]
+    // Size of TopDICT INDEX with 1 item of 20 bytes: 2 + 1 + 2*4 + 20 = 31
+    // Size of String INDEX (empty): 2
+    // Size of Global Subrs INDEX (empty): 2
+    cs_off := top_idx_pos + 31 + 2 + 2
+    fdsel_off := cs_off + cs_idx.data.len
+    fda_off := fdsel_off + fd_sel.data.len
+    // FDArray has 2 FontDICTs, each 11 bytes (Private size + off + op 18):
+    // size of FDArray INDEX = 2 + 1 + 3*4 + 22 = 37
+    p0_off := fda_off + 37
+    p1_off := p0_off + priv0.data.len + ls0_idx.data.len
+
+    mut top_dict := Buf::new()
+    push_cff_int32(&mut top_dict, cs_off); top_dict.push_u8(17)
+    push_cff_int32(&mut top_dict, fda_off); top_dict.push_u8(12); top_dict.push_u8(36)
+    push_cff_int32(&mut top_dict, fdsel_off); top_dict.push_u8(12); top_dict.push_u8(37)
+
+    mut fd0_d := Buf::new()
+    push_cff_int32(&mut fd0_d, priv0.data.len); push_cff_int32(&mut fd0_d, p0_off); fd0_d.push_u8(18)
+    mut fd1_d := Buf::new()
+    push_cff_int32(&mut fd1_d, priv1.data.len); push_cff_int32(&mut fd1_d, p1_off); fd1_d.push_u8(18)
+    mut fda_flat := Buf::new()
+    f0 := 0; fda_flat.push_bytes(&fd0_d.data)
+    f1 := fda_flat.data.len; fda_flat.push_bytes(&fd1_d.data)
+    f2 := fda_flat.data.len
+    mut fda_idx := Buf::new()
+    fda_offs: []i32 = [f0, f1, f2]
+    push_cff_index(&mut fda_idx, &fda_flat.data, &fda_offs, false)
+
+    mut cff_buf := Buf::new()
+    cff_buf.push_bytes(&hdr_prefix.data)
+    td_offs: []i32 = [0, top_dict.data.len]
+    push_cff_index(&mut cff_buf, &top_dict.data, &td_offs, false)
+    push_cff_index(&mut cff_buf, &empty_u8, &zero_offs, false) // String
+    push_cff_index(&mut cff_buf, &empty_u8, &zero_offs, false) // GSubrs
+    cff_buf.push_bytes(&cs_idx.data)
+    cff_buf.push_bytes(&fd_sel.data)
+    cff_buf.push_bytes(&fda_idx.data)
+    cff_buf.push_bytes(&priv0.data)
+    cff_buf.push_bytes(&ls0_idx.data)
+    cff_buf.push_bytes(&priv1.data)
+    cff_buf.push_bytes(&ls1_idx.data)
+
+    mut pk := TablePack::new()
+    pk.add_owned("head", tbl_head(1000, 0))
+    pk.add_owned("maxp", tbl_maxp_cff(3))
+    pk.add_owned("hhea", tbl_hhea(800, -200, 0, 3))
+    ha: []i32 = [500, 600, 700]; hl: []i32 = [0, 50, 100]
+    pk.add_owned("hmtx", tbl_hmtx(&ha, &hl))
+    pk.add_owned("name", tbl_name("SkriftCID", "Regular", "SkriftCID-Regular", "1.0"))
+    cc: []i32 = [65, 66]; cg: []i32 = [1, 2]
+    pk.add_owned("cmap", tbl_cmap_fmt4(&cc, &cg))
+    pk.add("CFF ", &cff_buf.data)
+    pk.build_sfnt(0x4F54544F)
+}
+
+pub fn build_gpos_fmt2_cov2_cls2() -> []u8 {
+    // Minimal SFNT whose GPOS LookupType 2 Format 2 uses Coverage Format 2 + ClassDef Format 2 + vf2=4
+    mut gpos := Buf::new()
+    gpos.push_u16(1); gpos.push_u16(0) // v1.0
+    gpos.push_u16(0); gpos.push_u16(10); gpos.push_u16(24)
+    // FeatureList at 10 (length 14): count(2)=1 + tag(4)='kern' + off(2)=8; FeatureTable at 18: params=0, lc=1, [0]
+    gpos.push_u16(1); gpos.push_tag("kern"); gpos.push_u16(8)
+    gpos.push_u16(0); gpos.push_u16(1); gpos.push_u16(0)
+    // LookupList at 24: count=1, off=4; Lookup 0: type=2, flag=0, subCount=1, off=8
+    gpos.push_u16(1); gpos.push_u16(4)
+    gpos.push_u16(2); gpos.push_u16(0); gpos.push_u16(1); gpos.push_u16(8)
+
+    // Subtable PairPos Format 2 (16 header + 2*2*4 = 16 bytes class table -> cov at +32)
+    mut sub := Buf::new()
+    sub.push_u16(2); sub.push_u16(32)
+    sub.push_u16(4); sub.push_u16(4) // both XAdvance! (4 bytes per pair)
+    sub.push_u16(42); sub.push_u16(52) // classDef1 at +42, classDef2 at +52
+    sub.push_u16(2); sub.push_u16(2)
+    // [0,0], [0,1], [1,0], [1,1] (each has XAdv1, XAdv2)
+    sub.push_i16(0); sub.push_i16(0)
+    sub.push_i16(0); sub.push_i16(0)
+    sub.push_i16(0); sub.push_i16(0)
+    sub.push_i16(-95); sub.push_i16(10)
+    // Coverage Format 2 at +32 (10 bytes): fmt=2, rangeCount=1, [start=2, end=3, startCov=0]
+    sub.push_u16(2); sub.push_u16(1); sub.push_u16(2); sub.push_u16(3); sub.push_u16(0)
+    // ClassDef1 Format 2 at +42 (10 bytes): fmt=2, rangeCount=1, [start=2, end=3, class=1]
+    sub.push_u16(2); sub.push_u16(1); sub.push_u16(2); sub.push_u16(3); sub.push_u16(1)
+    // ClassDef2 Format 2 at +52 (10 bytes): fmt=2, rangeCount=1, [start=4, end=5, class=1]
+    sub.push_u16(2); sub.push_u16(1); sub.push_u16(4); sub.push_u16(5); sub.push_u16(1)
+
+    gpos.push_bytes(&sub.data)
+    mut pk := TablePack::new()
+    pk.add("GPOS", &gpos.data)
+    pk.build_sfnt(0x00010000)
+}

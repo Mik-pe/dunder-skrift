@@ -1,0 +1,730 @@
+// OpenType `CFF ` and `CFF2` parser + Type 2 CharString VM:
+// supports INDEX v1/v2, DICT integer/real operands, PrivateDICT + Subrs,
+// GlobalSubrs, FDArray/FDSelect (Format 0/3/4), cubic Beziers, flex,
+// and CFF2 variable `vsindex`/`blend` via ItemVariationStore.
+import binary as bin
+import outline
+import sfnt
+import var as variation
+
+struct CffIndex {
+    ok: bool,
+    end_pos: i32,
+    offsets: []i32, // absolute offsets in font data; length == count + 1 (or 0 if empty)
+}
+
+impl CffIndex {
+    fn empty(pos: i32) -> Self {
+        Self { ok: true, end_pos: pos, offsets: [] }
+    }
+
+    fn count(&self) -> i32 {
+        if self.offsets.len <= 1 { return 0 }
+        self.offsets.len - 1
+    }
+
+    fn parse(data: &[]u8, pos: i32, limit: i32, is_cff2: bool) -> Self {
+        if pos < 0 || pos >= limit || limit > data.len {
+            return Self { ok: false, end_pos: pos, offsets: [] }
+        }
+        mut r := bin.Reader::slice(&data, pos, limit - pos)
+        count := if is_cff2 { i32(r.read_u32(&data)) } else { r.read_u16(&data) }
+        if !r.ok { return Self { ok: false, end_pos: pos, offsets: [] } }
+        if count == 0 {
+            return Self { ok: true, end_pos: r.pos, offsets: [] }
+        }
+        if count < 0 || count > 262144 {
+            return Self { ok: false, end_pos: pos, offsets: [] }
+        }
+        off_size := r.read_u8(&data)
+        if !r.ok || off_size < 1 || off_size > 4 {
+            return Self { ok: false, end_pos: pos, offsets: [] }
+        }
+        if r.remaining() < (count + 1) * off_size {
+            return Self { ok: false, end_pos: pos, offsets: [] }
+        }
+        data_base := r.pos + (count + 1) * off_size - 1
+        mut offsets: []i32 = []
+        offsets.reserve(count + 1)
+        for _ in 0..(count + 1) {
+            mut v := 0
+            for _ in 0..off_size {
+                v = v.shl(8).bit_or(r.read_u8(&data))
+            }
+            abs := data_base + v
+            if abs < data_base || abs > limit {
+                return Self { ok: false, end_pos: pos, offsets: [] }
+            }
+            offsets.push(abs)
+        }
+        Self { ok: true, end_pos: offsets[count], offsets: offsets }
+    }
+}
+
+struct PrivateFont {
+    default_width_x: f64,
+    nominal_width_x: f64,
+    vsindex: i32,
+    subrs: CffIndex,
+}
+
+impl PrivateFont {
+    fn empty() -> Self {
+        Self { default_width_x: 0.0, nominal_width_x: 0.0, vsindex: 0, subrs: CffIndex::empty(0) }
+    }
+}
+
+pub struct CffTable {
+    ok: bool,
+    present: bool,
+    is_cff2: bool,
+    error: string,
+    charstrings: CffIndex,
+    global_subrs: CffIndex,
+    ivs: variation.ItemVariationStore,
+    priv_default_wx: []f64,
+    priv_nominal_wx: []f64,
+    priv_vsindex: []i32,
+    priv_subr_starts: []i32,
+    priv_subr_ends: []i32,
+    priv_subr_offsets: []i32,
+    // FDSelect lookup (when priv_default_wx.len > 1)
+    fd_format: i32,
+    fd_bytes: []i32,        // Format 0: one fd index per gid
+    fd_range_first: []i32,  // Format 3/4: range starts
+    fd_range_fd: []i32,     // Format 3/4: range fd index
+    fd_sentinel: i32,
+}
+
+impl CffTable {
+    pub fn empty() -> Self {
+        Self {
+            ok: true, present: false, is_cff2: false, error: "",
+            charstrings: CffIndex::empty(0), global_subrs: CffIndex::empty(0),
+            ivs: variation.ItemVariationStore::empty(),
+            priv_default_wx: [], priv_nominal_wx: [], priv_vsindex: [],
+            priv_subr_starts: [], priv_subr_ends: [], priv_subr_offsets: [],
+            fd_format: -1, fd_bytes: [], fd_range_first: [], fd_range_fd: [], fd_sentinel: 0,
+        }
+    }
+
+    fn fail(move msg: string) -> Self {
+        mut out := Self::empty()
+        out.ok = false; out.present = true; out.error = msg
+        out
+    }
+
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        cff2_off := dir.table_offset("CFF2")
+        cff2_len := dir.table_length("CFF2")
+        if cff2_off >= 0 && cff2_len >= 5 {
+            return parse_cff_bytes(&dir.data, cff2_off, cff2_len, true)
+        }
+        cff_off := dir.table_offset("CFF ")
+        cff_len := dir.table_length("CFF ")
+        if cff_off >= 0 && cff_len >= 4 {
+            return parse_cff_bytes(&dir.data, cff_off, cff_len, false)
+        }
+        Self::empty()
+    }
+
+    pub fn decode_glyph(&self, data: &[]u8, gid: i32, norm_coords: &[]f64) -> outline.Outline {
+        if !self.present || !self.ok {
+            return outline.Outline::fail("CFF table unavailable")
+        }
+        if gid < 0 || gid >= self.charstrings.count() {
+            return outline.Outline::fail("CFF glyph ID out of range")
+        }
+        cs_start := self.charstrings.offsets[gid]
+        cs_end := self.charstrings.offsets[gid + 1]
+        mut fd_idx := self.fd_for_glyph(gid)
+        if fd_idx < 0 || fd_idx >= self.priv_default_wx.len { fd_idx = 0 }
+        empty_scalars: []f64 = []
+        scalars := if self.is_cff2 && self.ivs.ok {
+            self.ivs.region_scalars(&norm_coords)
+        } else {
+            empty_scalars
+        }
+        run_type2(&data, cs_start, cs_end, &self, fd_idx, &scalars)
+    }
+
+    fn fd_for_glyph(&self, gid: i32) -> i32 {
+        if self.priv_default_wx.len <= 1 || self.fd_format < 0 { return 0 }
+        if self.fd_format == 0 {
+            if gid >= 0 && gid < self.fd_bytes.len { return self.fd_bytes[gid] }
+            return 0
+        }
+        if self.fd_range_first.len == 0 || gid < self.fd_range_first[0] || gid >= self.fd_sentinel {
+            return 0
+        }
+        mut lo := 0
+        mut hi := self.fd_range_first.len
+        while lo + 1 < hi {
+            mid := lo + (hi - lo) / 2
+            if self.fd_range_first[mid] <= gid { lo = mid } else { hi = mid }
+        }
+        self.fd_range_fd[lo]
+    }
+}
+
+fn push_private(out: &mut CffTable, p: &PrivateFont) {
+    out.priv_default_wx.push(p.default_width_x)
+    out.priv_nominal_wx.push(p.nominal_width_x)
+    out.priv_vsindex.push(p.vsindex)
+    out.priv_subr_starts.push(out.priv_subr_offsets.len)
+    for off in &p.subrs.offsets { out.priv_subr_offsets.push(off) }
+    out.priv_subr_ends.push(out.priv_subr_offsets.len)
+}
+
+fn parse_cff_bytes(data: &[]u8, base: i32, length: i32, is_cff2: bool) -> CffTable {
+    limit := base + length
+    if limit > data.len { return CffTable::fail("truncated CFF table") }
+    major := i32(data[base])
+    hdr_size := i32(data[base + 2])
+    if (!is_cff2 && major != 1) || (is_cff2 && major != 2) || base + hdr_size > limit {
+        return CffTable::fail("unsupported CFF header")
+    }
+
+    mut top_start := base + hdr_size
+    mut top_end := top_start
+    mut gsubrs := CffIndex::empty(0)
+    if is_cff2 {
+        if hdr_size < 5 { return CffTable::fail("invalid CFF2 header size") }
+        td_len := bin.peek_u16(&data, base + 3)
+        top_end = top_start + td_len
+        if top_end > limit { return CffTable::fail("truncated CFF2 TopDICT") }
+        gsubrs = CffIndex::parse(&data, top_end, limit, true)
+    } else {
+        name_idx := CffIndex::parse(&data, base + hdr_size, limit, false)
+        if !name_idx.ok { return CffTable::fail("invalid CFF Name INDEX") }
+        top_idx := CffIndex::parse(&data, name_idx.end_pos, limit, false)
+        if !top_idx.ok || top_idx.count() < 1 { return CffTable::fail("invalid CFF Top DICT INDEX") }
+        top_start = top_idx.offsets[0]
+        top_end = top_idx.offsets[1]
+        str_idx := CffIndex::parse(&data, top_idx.end_pos, limit, false)
+        if !str_idx.ok { return CffTable::fail("invalid CFF String INDEX") }
+        gsubrs = CffIndex::parse(&data, str_idx.end_pos, limit, false)
+    }
+    if !gsubrs.ok { return CffTable::fail("invalid CFF Global Subrs INDEX") }
+
+    td := parse_dict(&data, top_start, top_end)
+    if td.charstrings_off <= 0 || base + td.charstrings_off >= limit {
+        return CffTable::fail("missing CFF CharStrings")
+    }
+    cs_idx := CffIndex::parse(&data, base + td.charstrings_off, limit, is_cff2)
+    if !cs_idx.ok { return CffTable::fail("invalid CFF CharStrings INDEX") }
+
+    mut ivs := variation.ItemVariationStore::empty()
+    if is_cff2 && td.vstore_off > 0 && base + td.vstore_off + 2 < limit {
+        vs_off := base + td.vstore_off
+        if vs_off + 2 <= limit {
+            vs_len := bin.peek_u16(&data, vs_off)
+            ivs = variation.ItemVariationStore::parse(&data, vs_off + 2, vs_len)
+        }
+    }
+
+    mut out := CffTable {
+        ok: true, present: true, is_cff2: is_cff2, error: "",
+        charstrings: cs_idx, global_subrs: gsubrs, ivs: ivs,
+        priv_default_wx: [], priv_nominal_wx: [], priv_vsindex: [],
+        priv_subr_starts: [], priv_subr_ends: [], priv_subr_offsets: [],
+        fd_format: -1, fd_bytes: [], fd_range_first: [], fd_range_fd: [], fd_sentinel: 0,
+    }
+
+    if td.fd_array_off > 0 && base + td.fd_array_off < limit {
+        fda := CffIndex::parse(&data, base + td.fd_array_off, limit, is_cff2)
+        if fda.ok {
+            for fi in 0..fda.count() {
+                fd_d := parse_dict(&data, fda.offsets[fi], fda.offsets[fi + 1])
+                p := parse_private(&data, base, limit, fd_d.private_size, fd_d.private_off, is_cff2)
+                push_private(&mut out, &p)
+            }
+        }
+        if td.fd_select_off > 0 && base + td.fd_select_off < limit {
+            mut r := bin.Reader::slice(&data, base + td.fd_select_off, limit - (base + td.fd_select_off))
+            out.fd_format = r.read_u8(&data)
+            if out.fd_format == 0 {
+                ng := out.charstrings.count()
+                for _ in 0..ng { out.fd_bytes.push(r.read_u8(&data)) }
+            } else if out.fd_format == 3 || out.fd_format == 4 {
+                nr := if out.fd_format == 4 { i32(r.read_u32(&data)) } else { r.read_u16(&data) }
+                for _ in 0..nr {
+                    first_g := if out.fd_format == 4 { i32(r.read_u32(&data)) } else { r.read_u16(&data) }
+                    fd := r.read_u8(&data)
+                    if !r.ok { break }
+                    out.fd_range_first.push(first_g)
+                    out.fd_range_fd.push(fd)
+                }
+                out.fd_sentinel = if out.fd_format == 4 { i32(r.read_u32(&data)) } else { r.read_u16(&data) }
+            }
+        }
+    } else if td.private_size > 0 && td.private_off > 0 {
+        p := parse_private(&data, base, limit, td.private_size, td.private_off, is_cff2)
+        push_private(&mut out, &p)
+    } else {
+        p := PrivateFont::empty()
+        push_private(&mut out, &p)
+    }
+    out
+}
+
+fn parse_private(data: &[]u8, cff_base: i32, limit: i32, size: i32, rel_off: i32, is_cff2: bool) -> PrivateFont {
+    if size <= 0 || rel_off <= 0 { return PrivateFont::empty() }
+    abs := cff_base + rel_off
+    if abs < cff_base || abs + size > limit { return PrivateFont::empty() }
+    d := parse_dict(&data, abs, abs + size)
+    mut subrs := CffIndex::empty(0)
+    if d.subrs_rel > 0 && abs + d.subrs_rel < limit {
+        subrs = CffIndex::parse(&data, abs + d.subrs_rel, limit, is_cff2)
+    }
+    PrivateFont {
+        default_width_x: d.default_width_x,
+        nominal_width_x: d.nominal_width_x,
+        vsindex: d.vsindex,
+        subrs: subrs,
+    }
+}
+
+struct DictValues {
+    charstrings_off: i32,
+    private_size: i32,
+    private_off: i32,
+    subrs_rel: i32,
+    fd_array_off: i32,
+    fd_select_off: i32,
+    vstore_off: i32,
+    default_width_x: f64,
+    nominal_width_x: f64,
+    vsindex: i32,
+}
+
+fn parse_dict(data: &[]u8, start: i32, end: i32) -> DictValues {
+    mut out := DictValues {
+        charstrings_off: -1, private_size: 0, private_off: -1, subrs_rel: -1,
+        fd_array_off: -1, fd_select_off: -1, vstore_off: -1,
+        default_width_x: 0.0, nominal_width_x: 0.0, vsindex: 0,
+    }
+    mut stack: []f64 = []
+    mut pos := start
+    while pos < end {
+        b0 := i32(data[pos])
+        if b0 <= 21 || b0 == 22 || b0 == 24 {
+            mut op := b0
+            pos += 1
+            if b0 == 12 {
+                if pos >= end { break }
+                op = 256 + i32(data[pos])
+                pos += 1
+            }
+            if op == 17 && stack.len >= 1 { out.charstrings_off = i32(stack[0]) }
+            else if op == 18 && stack.len >= 2 {
+                out.private_size = i32(stack[0])
+                out.private_off = i32(stack[1])
+            }
+            else if op == 19 && stack.len >= 1 { out.subrs_rel = i32(stack[0]) }
+            else if op == 20 && stack.len >= 1 { out.default_width_x = stack[0] }
+            else if op == 21 && stack.len >= 1 { out.nominal_width_x = stack[0] }
+            else if op == 22 && stack.len >= 1 { out.vsindex = i32(stack[0]) }
+            else if op == 24 && stack.len >= 1 { out.vstore_off = i32(stack[0]) }
+            else if op == 256 + 36 && stack.len >= 1 { out.fd_array_off = i32(stack[0]) }
+            else if op == 256 + 37 && stack.len >= 1 { out.fd_select_off = i32(stack[0]) }
+            stack.clear()
+        } else if b0 == 28 && pos + 3 <= end {
+            raw := i32(data[pos + 1]).shl(8).bit_or(i32(data[pos + 2]))
+            v := if raw >= 32768 { raw - 65536 } else { raw }
+            stack.push(f64(v))
+            pos += 3
+        } else if b0 == 29 && pos + 5 <= end {
+            raw := (u32(data[pos + 1]).shl(24)
+                .bit_or(u32(data[pos + 2]).shl(16))
+                .bit_or(u32(data[pos + 3]).shl(8))
+                .bit_or(u32(data[pos + 4])))
+            v := if i64(raw) >= 2147483648 { i32(i64(raw) - 4294967296) } else { i32(raw) }
+            stack.push(f64(v))
+            pos += 5
+        } else if b0 == 30 {
+            pos += 1
+            // Parse CFF BCD real operand cleanly as f64.
+            mut val := 0.0
+            mut frac := 0.0
+            mut frac_div := 1.0
+            mut neg := false
+            mut in_frac := false
+            mut in_exp := false
+            mut exp_neg := false
+            mut exp_val := 0
+            mut done := false
+            while pos < end && !done {
+                byte := i32(data[pos])
+                pos += 1
+                for half in 0..2 {
+                    nib := if half == 0 { byte.shr(4) } else { byte.bit_and(15) }
+                    if nib == 15 { done = true; break }
+                    if nib <= 9 {
+                        if in_exp { exp_val = exp_val * 10 + nib }
+                        else if in_frac { frac_div *= 10.0; frac += f64(nib) / frac_div }
+                        else { val = val * 10.0 + f64(nib) }
+                    } else if nib == 10 { in_frac = true }
+                    else if nib == 11 { in_exp = true; exp_neg = false }
+                    else if nib == 12 { in_exp = true; exp_neg = true }
+                    else if nib == 14 { neg = true }
+                }
+            }
+            mut res := val + frac
+            if neg { res = -res }
+            for _ in 0..exp_val {
+                if exp_neg { res = res / 10.0 } else { res = res * 10.0 }
+            }
+            stack.push(res)
+        } else if b0 >= 32 && b0 <= 246 {
+            stack.push(f64(b0 - 139))
+            pos += 1
+        } else if b0 >= 247 && b0 <= 250 && pos + 2 <= end {
+            b1 := i32(data[pos + 1])
+            stack.push(f64((b0 - 247) * 256 + b1 + 108))
+            pos += 2
+        } else if b0 >= 251 && b0 <= 254 && pos + 2 <= end {
+            b1 := i32(data[pos + 1])
+            stack.push(f64(-(b0 - 251) * 256 - b1 - 108))
+            pos += 2
+        } else {
+            pos += 1
+        }
+    }
+    out
+}
+
+// --- Type 2 CharString VM ---
+
+struct Type2State {
+    stack: []f64,
+    x: f64,
+    y: f64,
+    started: bool,
+    width_parsed: bool,
+    stem_count: i32,
+    vsindex: i32,
+    out: outline.Outline,
+    ok: bool,
+    error: string,
+}
+
+fn subr_bias(count: i32) -> i32 {
+    if count < 1240 { return 107 }
+    if count < 33900 { return 1131 }
+    32768
+}
+
+fn run_type2(data: &[]u8, start: i32, end: i32, cff: &CffTable, fd_idx: i32, scalars: &[]f64) -> outline.Outline {
+    init_vs := if fd_idx >= 0 && fd_idx < cff.priv_vsindex.len { cff.priv_vsindex[fd_idx] } else { 0 }
+    mut st := Type2State {
+        stack: [], x: 0.0, y: 0.0, started: false,
+        width_parsed: cff.is_cff2, stem_count: 0, vsindex: init_vs,
+        out: outline.Outline::new(), ok: true, error: "",
+    }
+    _ := exec_type2(&mut st, &data, start, end, &cff, fd_idx, &scalars, 0)
+    if !st.ok {
+        return outline.Outline::fail(move st.error)
+    }
+    st.out
+}
+
+fn consume_width(st: &mut Type2State, odd_means_width: bool) {
+    if st.width_parsed { return }
+    st.width_parsed = true
+    has_width := if odd_means_width { st.stack.len % 2 == 1 } else { st.stack.len % 2 == 0 }
+    if has_width && st.stack.len > 0 {
+        // Shift out width operand at stack[0]
+        mut shifted: []f64 = []
+        for i in 1..st.stack.len { shifted.push(st.stack[i]) }
+        st.stack = shifted
+    }
+}
+
+fn exec_type2(st: &mut Type2State, data: &[]u8, start: i32, end: i32,
+    cff: &CffTable, fd_idx: i32, scalars: &[]f64, depth: i32) -> bool {
+    if depth > 16 { st.ok = false; st.error = "CFF subroutine recursion limit"; return false }
+    mut pos := start
+    while pos < end && st.ok {
+        b0 := i32(data[pos])
+        if b0 == 28 {
+            if pos + 3 > end { st.ok = false; st.error = "truncated Type2 int16"; return false }
+            raw := i32(data[pos + 1]).shl(8).bit_or(i32(data[pos + 2]))
+            v := if raw >= 32768 { raw - 65536 } else { raw }
+            st.stack.push(f64(v))
+            pos += 3
+            continue
+        }
+        if b0 >= 32 && b0 <= 246 {
+            st.stack.push(f64(b0 - 139)); pos += 1; continue
+        }
+        if b0 >= 247 && b0 <= 250 {
+            if pos + 2 > end { st.ok = false; st.error = "truncated Type2 int"; return false }
+            st.stack.push(f64((b0 - 247) * 256 + i32(data[pos + 1]) + 108))
+            pos += 2; continue
+        }
+        if b0 >= 251 && b0 <= 254 {
+            if pos + 2 > end { st.ok = false; st.error = "truncated Type2 int"; return false }
+            st.stack.push(f64(-(b0 - 251) * 256 - i32(data[pos + 1]) - 108))
+            pos += 2; continue
+        }
+        if b0 == 255 {
+            if pos + 5 > end { st.ok = false; st.error = "truncated Type2 16.16"; return false }
+            raw := (u32(data[pos + 1]).shl(24)
+                .bit_or(u32(data[pos + 2]).shl(16))
+                .bit_or(u32(data[pos + 3]).shl(8))
+                .bit_or(u32(data[pos + 4])))
+            v := if i64(raw) >= 2147483648 { i32(i64(raw) - 4294967296) } else { i32(raw) }
+            st.stack.push(f64(v) / 65536.0)
+            pos += 5; continue
+        }
+
+        // Operator byte
+        mut op := b0
+        pos += 1
+        if b0 == 12 {
+            if pos >= end { st.ok = false; st.error = "truncated Type2 escape op"; return false }
+            op = 256 + i32(data[pos])
+            pos += 1
+        }
+
+        if op == 1 || op == 3 || op == 18 || op == 23 {
+            // hstem / vstem / hstemhm / vstemhm
+            consume_width(&mut st, true)
+            st.stem_count += st.stack.len / 2
+            st.stack.clear()
+        } else if op == 19 || op == 20 {
+            // hintmask / cntrmask
+            if !st.width_parsed && st.stack.len > 0 { consume_width(&mut st, true) }
+            st.width_parsed = true
+            st.stem_count += st.stack.len / 2
+            st.stack.clear()
+            mask_bytes := (st.stem_count + 7) / 8
+            if pos + mask_bytes > end { st.ok = false; st.error = "truncated hintmask"; return false }
+            pos += mask_bytes
+        } else if op == 21 {
+            // rmoveto
+            consume_width(&mut st, true)
+            if st.stack.len < 2 { st.ok = false; st.error = "rmoveto underflow"; return false }
+            st.x += st.stack[0]; st.y += st.stack[1]
+            st.out.move_to(st.x, st.y); st.started = true
+            st.stack.clear()
+        } else if op == 22 {
+            // hmoveto
+            consume_width(&mut st, false)
+            if st.stack.len < 1 { st.ok = false; st.error = "hmoveto underflow"; return false }
+            st.x += st.stack[0]
+            st.out.move_to(st.x, st.y); st.started = true
+            st.stack.clear()
+        } else if op == 4 {
+            // vmoveto
+            consume_width(&mut st, false)
+            if st.stack.len < 1 { st.ok = false; st.error = "vmoveto underflow"; return false }
+            st.y += st.stack[0]
+            st.out.move_to(st.x, st.y); st.started = true
+            st.stack.clear()
+        } else if op == 5 {
+            // rlineto
+            mut i := 0
+            while i + 1 < st.stack.len {
+                st.x += st.stack[i]; st.y += st.stack[i + 1]
+                st.out.line_to(st.x, st.y)
+                i += 2
+            }
+            st.stack.clear()
+        } else if op == 6 || op == 7 {
+            // hlineto (starts horiz) / vlineto (starts vert)
+            mut horiz := op == 6
+            for i in 0..st.stack.len {
+                if horiz { st.x += st.stack[i] } else { st.y += st.stack[i] }
+                st.out.line_to(st.x, st.y)
+                horiz = !horiz
+            }
+            st.stack.clear()
+        } else if op == 8 {
+            // rrcurveto
+            mut i := 0
+            while i + 5 < st.stack.len {
+                emit_rel_cubic(&mut st, st.stack[i], st.stack[i + 1], st.stack[i + 2], st.stack[i + 3], st.stack[i + 4], st.stack[i + 5])
+                i += 6
+            }
+            st.stack.clear()
+        } else if op == 27 {
+            // hhcurveto
+            mut i := 0
+            mut dy1 := 0.0
+            if st.stack.len % 4 == 1 { dy1 = st.stack[0]; i = 1 }
+            while i + 3 < st.stack.len {
+                emit_rel_cubic(&mut st, st.stack[i], dy1, st.stack[i + 1], st.stack[i + 2], st.stack[i + 3], 0.0)
+                dy1 = 0.0
+                i += 4
+            }
+            st.stack.clear()
+        } else if op == 26 {
+            // vvcurveto
+            mut i := 0
+            mut dx1 := 0.0
+            if st.stack.len % 4 == 1 { dx1 = st.stack[0]; i = 1 }
+            while i + 3 < st.stack.len {
+                emit_rel_cubic(&mut st, dx1, st.stack[i], st.stack[i + 1], st.stack[i + 2], 0.0, st.stack[i + 3])
+                dx1 = 0.0
+                i += 4
+            }
+            st.stack.clear()
+        } else if op == 30 || op == 31 {
+            // vhcurveto (30) / hvcurveto (31)
+            mut vert := op == 30
+            mut i := 0
+            while i + 3 < st.stack.len {
+                last_extra := if st.stack.len - i == 5 { st.stack[i + 4] } else { 0.0 }
+                if vert {
+                    emit_rel_cubic(&mut st, 0.0, st.stack[i], st.stack[i + 1], st.stack[i + 2], st.stack[i + 3], last_extra)
+                } else {
+                    emit_rel_cubic(&mut st, st.stack[i], 0.0, st.stack[i + 1], st.stack[i + 2], last_extra, st.stack[i + 3])
+                }
+                i += if st.stack.len - i == 5 { 5 } else { 4 }
+                vert = !vert
+            }
+            st.stack.clear()
+        } else if op == 24 {
+            // rcurveline
+            mut i := 0
+            while i + 7 < st.stack.len {
+                emit_rel_cubic(&mut st, st.stack[i], st.stack[i + 1], st.stack[i + 2], st.stack[i + 3], st.stack[i + 4], st.stack[i + 5])
+                i += 6
+            }
+            if i + 1 < st.stack.len {
+                st.x += st.stack[i]; st.y += st.stack[i + 1]
+                st.out.line_to(st.x, st.y)
+            }
+            st.stack.clear()
+        } else if op == 25 {
+            // rlinecurve
+            mut i := 0
+            while i + 7 < st.stack.len {
+                st.x += st.stack[i]; st.y += st.stack[i + 1]
+                st.out.line_to(st.x, st.y)
+                i += 2
+            }
+            if i + 5 < st.stack.len {
+                emit_rel_cubic(&mut st, st.stack[i], st.stack[i + 1], st.stack[i + 2], st.stack[i + 3], st.stack[i + 4], st.stack[i + 5])
+            }
+            st.stack.clear()
+        } else if op == 256 + 34 && st.stack.len >= 7 {
+            // hflex
+            emit_rel_cubic(&mut st, st.stack[0], 0.0, st.stack[1], st.stack[2], st.stack[3], 0.0)
+            emit_rel_cubic(&mut st, st.stack[4], 0.0, st.stack[5], -st.stack[2], st.stack[6], 0.0)
+            st.stack.clear()
+        } else if op == 256 + 35 && st.stack.len >= 13 {
+            // flex
+            emit_rel_cubic(&mut st, st.stack[0], st.stack[1], st.stack[2], st.stack[3], st.stack[4], st.stack[5])
+            emit_rel_cubic(&mut st, st.stack[6], st.stack[7], st.stack[8], st.stack[9], st.stack[10], st.stack[11])
+            st.stack.clear()
+        } else if op == 256 + 36 && st.stack.len >= 9 {
+            // hflex1
+            dy := -(st.stack[1] + st.stack[3] + st.stack[7])
+            emit_rel_cubic(&mut st, st.stack[0], st.stack[1], st.stack[2], st.stack[3], st.stack[4], 0.0)
+            emit_rel_cubic(&mut st, st.stack[5], 0.0, st.stack[6], st.stack[7], st.stack[8], dy)
+            st.stack.clear()
+        } else if op == 256 + 37 && st.stack.len >= 11 {
+            // flex1
+            dx_sum := st.stack[0] + st.stack[2] + st.stack[4] + st.stack[6] + st.stack[8]
+            dy_sum := st.stack[1] + st.stack[3] + st.stack[5] + st.stack[7] + st.stack[9]
+            if dx_sum.abs() > dy_sum.abs() {
+                emit_rel_cubic(&mut st, st.stack[0], st.stack[1], st.stack[2], st.stack[3], st.stack[4], st.stack[5])
+                emit_rel_cubic(&mut st, st.stack[6], st.stack[7], st.stack[8], st.stack[9], st.stack[10], -dy_sum)
+            } else {
+                emit_rel_cubic(&mut st, st.stack[0], st.stack[1], st.stack[2], st.stack[3], st.stack[4], st.stack[5])
+                emit_rel_cubic(&mut st, st.stack[6], st.stack[7], st.stack[8], st.stack[9], -dx_sum, st.stack[10])
+            }
+            st.stack.clear()
+        } else if op == 10 || op == 29 {
+            // callsubr (10) / callgsubr (29)
+            if st.stack.len < 1 { st.ok = false; st.error = "subr stack underflow"; return false }
+            raw_idx := i32(st.stack.pop())
+            mut s0 := 0
+            mut s1 := 0
+            if op == 10 {
+                sub_start := if fd_idx >= 0 && fd_idx < cff.priv_subr_starts.len { cff.priv_subr_starts[fd_idx] } else { 0 }
+                sub_end := if fd_idx >= 0 && fd_idx < cff.priv_subr_ends.len { cff.priv_subr_ends[fd_idx] } else { 0 }
+                cnt := if sub_end - sub_start > 1 { sub_end - sub_start - 1 } else { 0 }
+                idx := raw_idx + subr_bias(cnt)
+                if idx < 0 || idx >= cnt { st.ok = false; st.error = "CFF local subroutine out of range"; return false }
+                s0 = cff.priv_subr_offsets[sub_start + idx]
+                s1 = cff.priv_subr_offsets[sub_start + idx + 1]
+            } else {
+                cnt := cff.global_subrs.count()
+                idx := raw_idx + subr_bias(cnt)
+                if idx < 0 || idx >= cnt { st.ok = false; st.error = "CFF global subroutine out of range"; return false }
+                s0 = cff.global_subrs.offsets[idx]
+                s1 = cff.global_subrs.offsets[idx + 1]
+            }
+            if !exec_type2(&mut st, &data, s0, s1, &cff, fd_idx, &scalars, depth + 1) { return false }
+        } else if op == 11 {
+            // return
+            return true
+        } else if op == 14 {
+            // endchar
+            consume_width(&mut st, true)
+            st.stack.clear()
+            return false
+        } else if op == 15 && st.stack.len >= 1 {
+            // CFF2 vsindex
+            st.vsindex = i32(st.stack.pop())
+        } else if op == 16 && cff.is_cff2 && st.stack.len >= 1 {
+            // CFF2 blend
+            n := i32(st.stack.pop())
+            k := cff2_region_count(&cff.ivs, &data, st.vsindex)
+            need := n * (k + 1)
+            if n < 0 || k < 0 || st.stack.len < need {
+                st.ok = false; st.error = "CFF2 blend stack underflow"; return false
+            }
+            base_start := st.stack.len - need
+            delta_start := base_start + n
+            mut reg_indices := cff2_region_indices(&cff.ivs, &data, st.vsindex)
+            for i in 0..n {
+                mut sum := st.stack[base_start + i]
+                for j in 0..k {
+                    ridx := if j < reg_indices.len { reg_indices[j] } else { -1 }
+                    sc := if ridx >= 0 && ridx < scalars.len { scalars[ridx] } else { 0.0 }
+                    sum += st.stack[delta_start + i * k + j] * sc
+                }
+                st.stack[base_start + i] = sum
+            }
+            for _ in 0..(n * k) { _ := st.stack.pop() }
+        } else {
+            st.stack.clear()
+        }
+    }
+    true
+}
+
+fn emit_rel_cubic(st: &mut Type2State, dx1: f64, dy1: f64, dx2: f64, dy2: f64, dx3: f64, dy3: f64) {
+    c1x := st.x + dx1; c1y := st.y + dy1
+    c2x := c1x + dx2; c2y := c1y + dy2
+    ex := c2x + dx3; ey := c2y + dy3
+    st.out.cubic_to(c1x, c1y, c2x, c2y, ex, ey)
+    st.x = ex; st.y = ey
+}
+
+fn cff2_region_count(ivs: &variation.ItemVariationStore, data: &[]u8, vsindex: i32) -> i32 {
+    if !ivs.ok || vsindex < 0 || vsindex >= ivs.data_offsets.len { return 0 }
+    rel := ivs.data_offsets[vsindex]
+    if rel < 0 { return 0 }
+    abs := ivs.base_offset + rel
+    if abs + 6 > data.len { return 0 }
+    bin.peek_u16(&data, abs + 4)
+}
+
+fn cff2_region_indices(ivs: &variation.ItemVariationStore, data: &[]u8, vsindex: i32) -> []i32 {
+    mut out: []i32 = []
+    if !ivs.ok || vsindex < 0 || vsindex >= ivs.data_offsets.len { return out }
+    rel := ivs.data_offsets[vsindex]
+    if rel < 0 { return out }
+    abs := ivs.base_offset + rel
+    if abs + 6 > data.len { return out }
+    k := bin.peek_u16(&data, abs + 4)
+    if abs + 6 + k * 2 > data.len { return out }
+    for j in 0..k { out.push(bin.peek_u16(&data, abs + 6 + j * 2)) }
+    out
+}

@@ -1,0 +1,279 @@
+// Kerning & glyph positioning: legacy `kern` (Format 0) + OpenType `GPOS`
+// Pair Adjustment (LookupType 2, Format 1 & Format 2) and Extension LookupType 9.
+import binary as bin
+import sfnt
+
+pub struct KernTable {
+    // Legacy Format 0 pairs (sorted by packed key: (left << 16) | right)
+    legacy_keys: []i64,
+    legacy_vals: []i32,
+    // GPOS subtable offsets in font bytes
+    gpos_subtables: []i32,
+    gpos_end: i32,
+}
+
+impl KernTable {
+    pub fn parse(dir: &sfnt.TableDirectory) -> Self {
+        mut out := Self { legacy_keys: [], legacy_vals: [], gpos_subtables: [], gpos_end: 0 }
+        parse_legacy_kern(&dir, &mut out)
+        parse_gpos_kern(&dir, &mut out)
+        out
+    }
+
+    pub fn has_kerning(&self) -> bool {
+        self.legacy_keys.len > 0 || self.gpos_subtables.len > 0
+    }
+
+    pub fn kern_x(&self, data: &[]u8, left_gid: i32, right_gid: i32) -> i32 {
+        if left_gid < 0 || right_gid < 0 { return 0 }
+        // Prefer OpenType GPOS PairPos ('kern' feature) when available.
+        for sub_off in &self.gpos_subtables {
+            v := eval_pair_pos(&data, sub_off, self.gpos_end, left_gid, right_gid)
+            if v != 0 { return v }
+        }
+        // Fallback to legacy `kern` Format 0.
+        if self.legacy_keys.len == 0 { return 0 }
+        want := i64(left_gid).shl(16).bit_or(i64(right_gid))
+        mut lo := 0
+        mut hi := self.legacy_keys.len
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            k := self.legacy_keys[mid]
+            if k == want { return self.legacy_vals[mid] }
+            if k < want { lo = mid + 1 }
+            else { hi = mid }
+        }
+        0
+    }
+}
+
+fn parse_legacy_kern(dir: &sfnt.TableDirectory, out: &mut KernTable) {
+    off := dir.table_offset("kern")
+    length := dir.table_length("kern")
+    if off < 0 || length < 4 { return }
+    mut r := bin.Reader::slice(&dir.data, off, length)
+    ver := r.read_u16(&dir.data)
+    if ver == 0 {
+        n_tables := r.read_u16(&dir.data)
+        if !r.ok || n_tables <= 0 { return }
+        for _ in 0..n_tables {
+            if r.remaining() < 6 { break }
+            _ := r.read_u16(&dir.data) // subtable version
+            sub_len := r.read_u16(&dir.data)
+            cov := r.read_u16(&dir.data)
+            if !r.ok || sub_len < 6 || r.remaining() < sub_len - 6 { break }
+            fmt := cov.shr(8)
+            horiz := cov.bit_and(1) != 0
+            override_flag := cov.bit_and(8) != 0
+            if fmt == 0 && horiz && !override_flag && r.remaining() >= 8 {
+                n_pairs := r.read_u16(&dir.data)
+                r.skip(6) // searchRange, entrySelector, rangeShift
+                for _ in 0..n_pairs {
+                    if r.remaining() < 6 { break }
+                    l := r.read_u16(&dir.data)
+                    rg := r.read_u16(&dir.data)
+                    v := r.read_i16(&dir.data)
+                    out.legacy_keys.push(i64(l).shl(16).bit_or(i64(rg)))
+                    out.legacy_vals.push(v)
+                }
+                return
+            } else {
+                r.skip(sub_len - 6)
+            }
+        }
+    }
+}
+
+fn parse_gpos_kern(dir: &sfnt.TableDirectory, out: &mut KernTable) {
+    off := dir.table_offset("GPOS")
+    length := dir.table_length("GPOS")
+    if off < 0 || length < 10 { return }
+    out.gpos_end = off + length
+    mut r := bin.Reader::slice(&dir.data, off, length)
+    major := r.read_u16(&dir.data)
+    _ := r.read_u16(&dir.data) // minor
+    _ := r.read_u16(&dir.data) // scriptListOffset
+    feat_rel := r.read_u16(&dir.data)
+    lookup_rel := r.read_u16(&dir.data)
+    if !r.ok || major != 1 || feat_rel == 0 || lookup_rel == 0 { return }
+
+    feat_off := off + feat_rel
+    lookup_list_off := off + lookup_rel
+    if feat_off + 2 > out.gpos_end || lookup_list_off + 2 > out.gpos_end { return }
+
+    // Collect lookup indices belonging to feature tag 'kern'
+    kern_tag := bin.tag_from_str("kern")
+    feat_count := bin.peek_u16(&dir.data, feat_off)
+    mut lookup_indices: []i32 = []
+    for i in 0..feat_count {
+        rec := feat_off + 2 + i * 6
+        if rec + 6 > out.gpos_end { break }
+        tag := bin.peek_u32(&dir.data, rec)
+        if tag != kern_tag { continue }
+        ft_off := feat_off + bin.peek_u16(&dir.data, rec + 4)
+        if ft_off + 4 > out.gpos_end { continue }
+        lc := bin.peek_u16(&dir.data, ft_off + 2)
+        for j in 0..lc {
+            if ft_off + 4 + j * 2 + 2 > out.gpos_end { break }
+            lidx := bin.peek_u16(&dir.data, ft_off + 4 + j * 2)
+            mut seen := false
+            for x in &lookup_indices { if x == lidx { seen = true; break } }
+            if !seen { lookup_indices.push(lidx) }
+        }
+    }
+
+    lookup_count := bin.peek_u16(&dir.data, lookup_list_off)
+    for lidx in &lookup_indices {
+        if lidx < 0 || lidx >= lookup_count { continue }
+        l_off := lookup_list_off + bin.peek_u16(&dir.data, lookup_list_off + 2 + lidx * 2)
+        if l_off + 6 > out.gpos_end { continue }
+        l_type := bin.peek_u16(&dir.data, l_off)
+        sub_count := bin.peek_u16(&dir.data, l_off + 4)
+        for s in 0..sub_count {
+            if l_off + 6 + s * 2 + 2 > out.gpos_end { break }
+            mut sub_off := l_off + bin.peek_u16(&dir.data, l_off + 6 + s * 2)
+            if l_type == 9 {
+                if sub_off + 8 > out.gpos_end { continue }
+                ext_type := bin.peek_u16(&dir.data, sub_off + 2)
+                if ext_type != 2 { continue }
+                ext_rel := bin.peek_u32(&dir.data, sub_off + 4)
+                if i64(sub_off) + i64(ext_rel) >= i64(out.gpos_end) { continue }
+                sub_off += i32(ext_rel)
+                out.gpos_subtables.push(sub_off)
+            } else if l_type == 2 {
+                out.gpos_subtables.push(sub_off)
+            }
+        }
+    }
+}
+
+fn value_record_size(fmt: i32) -> i32 {
+    mut count := 0
+    for bit in 0..8 {
+        if fmt.bit_and(i32(1).shl(bit)) != 0 { count += 1 }
+    }
+    count * 2
+}
+
+fn read_value_x_advance(data: &[]u8, pos: i32, fmt: i32, end: i32) -> i32 {
+    if fmt == 0 { return 0 }
+    mut off := pos
+    // bit 0: XPlacement, bit 1: YPlacement, bit 2: XAdvance
+    if fmt.bit_and(1) != 0 { off += 2 }
+    if fmt.bit_and(2) != 0 { off += 2 }
+    if fmt.bit_and(4) != 0 {
+        if off + 2 > end { return 0 }
+        return bin.peek_i16(&data, off)
+    }
+    0
+}
+
+fn coverage_index(data: &[]u8, cov_off: i32, end: i32, gid: i32) -> i32 {
+    if cov_off < 0 || cov_off + 4 > end { return -1 }
+    fmt := bin.peek_u16(&data, cov_off)
+    cnt := bin.peek_u16(&data, cov_off + 2)
+    if fmt == 1 {
+        mut lo := 0
+        mut hi := cnt
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            p := cov_off + 4 + mid * 2
+            if p + 2 > end { return -1 }
+            g := bin.peek_u16(&data, p)
+            if g == gid { return mid }
+            if g < gid { lo = mid + 1 } else { hi = mid }
+        }
+        return -1
+    } else if fmt == 2 {
+        mut lo := 0
+        mut hi := cnt
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            p := cov_off + 4 + mid * 6
+            if p + 6 > end { return -1 }
+            start := bin.peek_u16(&data, p)
+            stop := bin.peek_u16(&data, p + 2)
+            if gid < start { hi = mid }
+            else if gid > stop { lo = mid + 1 }
+            else { return bin.peek_u16(&data, p + 4) + (gid - start) }
+        }
+    }
+    -1
+}
+
+fn class_of(data: &[]u8, cls_off: i32, end: i32, gid: i32) -> i32 {
+    if cls_off < 0 || cls_off + 4 > end { return 0 }
+    fmt := bin.peek_u16(&data, cls_off)
+    if fmt == 1 {
+        if cls_off + 6 > end { return 0 }
+        start := bin.peek_u16(&data, cls_off + 2)
+        cnt := bin.peek_u16(&data, cls_off + 4)
+        idx := gid - start
+        if idx < 0 || idx >= cnt { return 0 }
+        p := cls_off + 6 + idx * 2
+        if p + 2 > end { return 0 }
+        return bin.peek_u16(&data, p)
+    } else if fmt == 2 {
+        cnt := bin.peek_u16(&data, cls_off + 2)
+        mut lo := 0
+        mut hi := cnt
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            p := cls_off + 4 + mid * 6
+            if p + 6 > end { return 0 }
+            start := bin.peek_u16(&data, p)
+            stop := bin.peek_u16(&data, p + 2)
+            if gid < start { hi = mid }
+            else if gid > stop { lo = mid + 1 }
+            else { return bin.peek_u16(&data, p + 4) }
+        }
+    }
+    0
+}
+
+fn eval_pair_pos(data: &[]u8, sub_off: i32, end: i32, left: i32, right: i32) -> i32 {
+    if sub_off < 0 || sub_off + 10 > end { return 0 }
+    fmt := bin.peek_u16(&data, sub_off)
+    cov_rel := bin.peek_u16(&data, sub_off + 2)
+    vf1 := bin.peek_u16(&data, sub_off + 4)
+    vf2 := bin.peek_u16(&data, sub_off + 6)
+    cov_idx := coverage_index(&data, sub_off + cov_rel, end, left)
+    if cov_idx < 0 { return 0 }
+
+    sz1 := value_record_size(vf1)
+    sz2 := value_record_size(vf2)
+    if fmt == 1 {
+        ps_count := bin.peek_u16(&data, sub_off + 8)
+        if cov_idx >= ps_count { return 0 }
+        ps_rel := bin.peek_u16(&data, sub_off + 10 + cov_idx * 2)
+        ps_off := sub_off + ps_rel
+        if ps_off + 2 > end { return 0 }
+        pair_count := bin.peek_u16(&data, ps_off)
+        stride := 2 + sz1 + sz2
+        mut lo := 0
+        mut hi := pair_count
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            rec := ps_off + 2 + mid * stride
+            if rec + stride > end { return 0 }
+            sec := bin.peek_u16(&data, rec)
+            if sec == right {
+                return read_value_x_advance(&data, rec + 2, vf1, end)
+            }
+            if sec < right { lo = mid + 1 } else { hi = mid }
+        }
+    } else if fmt == 2 {
+        if sub_off + 16 > end { return 0 }
+        c1_off := sub_off + bin.peek_u16(&data, sub_off + 8)
+        c2_off := sub_off + bin.peek_u16(&data, sub_off + 10)
+        c1_count := bin.peek_u16(&data, sub_off + 12)
+        c2_count := bin.peek_u16(&data, sub_off + 14)
+        c1 := class_of(&data, c1_off, end, left)
+        c2 := class_of(&data, c2_off, end, right)
+        if c1 < 0 || c1 >= c1_count || c2 < 0 || c2 >= c2_count { return 0 }
+        rec := sub_off + 16 + (c1 * c2_count + c2) * (sz1 + sz2)
+        if rec + sz1 > end { return 0 }
+        return read_value_x_advance(&data, rec, vf1, end)
+    }
+    0
+}
