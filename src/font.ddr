@@ -1,5 +1,7 @@
 // High-level FreeType-inspired font face, metrics, variation, kerning,
 // color-layer, glyph-outline, and rasterization API in pure Dunder.
+capability filesystem
+
 import binary as bin
 import cff
 import cmap

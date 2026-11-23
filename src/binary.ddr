@@ -164,9 +164,10 @@ pub fn tag_to_string(tag: u32) -> string {
         if b >= 32 && b <= 126 { out.push(u8(b)) }
         else { out.push(b'?') }
     }
-    dec := bytes.decode(&out)
-    if dec.ok { return dec.value }
-    "????"
+    match bytes.decode(&out) {
+        .Ok(text) => text,
+        .Err(_) => "????",
+    }
 }
 
 pub fn sfnt_checksum(buf: &[]u8, offset: i32, length: i32) -> u32 {
@@ -213,9 +214,10 @@ pub fn decode_utf16be(buf: &[]u8, offset: i32, length: i32) -> string {
         }
         append_utf8_cp(&mut out, cp)
     }
-    dec := bytes.decode(&out)
-    if dec.ok { return dec.value }
-    ""
+    match bytes.decode(&out) {
+        .Ok(text) => text,
+        .Err(_) => "",
+    }
 }
 
 pub fn decode_macroman(buf: &[]u8, offset: i32, length: i32) -> string {
@@ -240,9 +242,10 @@ pub fn decode_macroman(buf: &[]u8, offset: i32, length: i32) -> string {
             append_utf8_cp(&mut out, high[b - 128])
         }
     }
-    dec := bytes.decode(&out)
-    if dec.ok { return dec.value }
-    ""
+    match bytes.decode(&out) {
+        .Ok(text) => text,
+        .Err(_) => "",
+    }
 }
 
 fn append_utf8_cp(out: &mut []u8, cp: i32) {

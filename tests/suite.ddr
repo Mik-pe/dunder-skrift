@@ -1,4 +1,6 @@
 // Comprehensive pure-Dunder test suite for dunder-skrift.
+capability filesystem
+
 import "../src/binary" as bin
 import "../src/cff" as cff
 import "../src/cmap" as cmap
@@ -158,7 +160,7 @@ fn approx(a: f64, b: f64, eps: f64) -> bool {
     // Check motif header "dunder-skrift-motif"
     motif := "dunder-skrift-motif"
     for m in 0..motif.len {
-        assert(i32(inf2.data[m]) == motif[m])
+        assert(inf2.data[m] == motif[m])
     }
     assert(inf2.data[845] == 69 && inf2.data[846] == 51) // tail "E3"
 }

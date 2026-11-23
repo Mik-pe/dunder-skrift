@@ -1,6 +1,8 @@
 // Synthetic binary font fixture builder for pure-Dunder tests.
 // Constructs valid in-memory SFNT/TTF, CFF, CFF2, TTC, WOFF1, variable font,
 // kerning/GPOS, cmap (0/4/6/12/14), CPAL/COLR v0, and DEFLATE zlib vectors.
+capability filesystem
+
 import "../src/binary" as bin
 
 pub struct Buf {

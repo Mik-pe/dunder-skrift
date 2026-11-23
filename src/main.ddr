@@ -1,5 +1,7 @@
 // `skrift` CLI for inspecting and rasterizing TTF, OTF (CFF/CFF2), TTC, WOFF1,
 // variable fonts, kerning, and color layers.
+capability filesystem, stdio
+
 import font
 import raster
 import std.bytes as bytes
@@ -21,7 +23,12 @@ fn usage() {
 struct ParsedDecimal { ok: bool, value: f64 }
 
 fn parse_decimal(arg: string) -> ParsedDecimal {
-    dot := text.find(arg, ".")
+    found := text.find(arg, ".")
+    mut dot := -1
+    match found {
+        .Some(index) => { dot = index },
+        .None => {},
+    }
     if dot < 0 {
         p := parse.integer(arg)
         return ParsedDecimal { ok: p.ok, value: f64(p.value) }
@@ -116,7 +123,12 @@ fn main() -> i32 {
         } else if a == "--axis" && i + 1 < argc {
             i += 1
             spec := sys.arg(i)
-            eq := text.find(spec, "=")
+            found := text.find(spec, "=")
+            mut eq := -1
+            match found {
+                .Some(index) => { eq = index },
+                .None => {},
+            }
             if eq != 4 || eq + 1 >= spec.len {
                 _ := sys.eprint("invalid --axis format; expected TAG=VALUE (e.g. wght=700)")
                 return 2

@@ -1,4 +1,6 @@
 // Consumer example importing `dunder-skrift` via `dunder.toml` [dependencies].
+capability filesystem, stdio
+
 import skrift.font as font
 import sys
 
