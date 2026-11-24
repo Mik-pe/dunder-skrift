@@ -4,7 +4,6 @@ capability filesystem, stdio
 
 import font
 import raster
-import std.bytes as bytes
 import std.parse as parse
 import std.text as text
 import sys
