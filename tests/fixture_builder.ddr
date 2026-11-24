@@ -1407,7 +1407,6 @@ pub fn build_synthetic_otf_cid_fdselect3() -> []u8 {
 
     // Precompute CFF layout with fixed-width 5-byte TopDICT/FDArray ints (each entry = 6 bytes!)
     // TopDICT: CharStrings(6), FDArray(7: 29 i32 + 12 36), FDSelect(7: 29 i32 + 12 37) = 20 bytes
-    top_dict_len := 20
     mut hdr_prefix := Buf::new()
     hdr_prefix.push_u8(1); hdr_prefix.push_u8(0); hdr_prefix.push_u8(4); hdr_prefix.push_u8(4)
     nm := "TestCID"

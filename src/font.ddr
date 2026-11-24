@@ -2,7 +2,6 @@
 // color-layer, glyph-outline, and rasterization API in pure Dunder.
 capability filesystem
 
-import binary as bin
 import cff
 import cmap
 import color
@@ -11,7 +10,6 @@ import gpos
 import outline
 import raster
 import sfnt
-import std.bytes as bytes
 import sys
 import tables
 import var as variation

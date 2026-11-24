@@ -1,7 +1,6 @@
 // Bounds-checked big-endian binary reader, SFNT tags, fixed-point helpers,
 // and text decoders (UTF-16BE, MacRoman) for OpenType/TrueType parsing.
 import std.bytes as bytes
-import sys
 
 pub struct Reader {
     pos: i32,
